@@ -6,6 +6,7 @@ from io import StringIO
 import random
 from collections import deque
 from datetime import datetime, timedelta
+import subprocess
 # import requests
 # import threading
 # from multiprocessing import Process
@@ -144,6 +145,95 @@ def STOCH(df, period=14, smooth_d=3):
 def EMA(df, period):
     return df['Close'].ewm(span=period, adjust=False).mean().round(2)
 
+def Indecision(df, threshold=0.2):
+    body = (df["Close"] - df["Open"]).abs()
+    candle_range = (df["High"] - df["Low"]).replace(0, 1e-9)
+
+    return (body / candle_range < threshold).astype(int)
+
+def EQH(df, lookback=36, tolerance=1):
+    highs = df["High"]
+
+    return highs.rolling(lookback).apply(
+        lambda x: int((abs(x[-1] - x[:-1]) <= tolerance).any()),
+        raw=True
+    ).fillna(0).astype(int)
+
+def EQL(df, lookback=36, tolerance=1):
+    lows = df["Low"]
+
+    return lows.rolling(lookback).apply(
+        lambda x: int((abs(x[-1] - x[:-1]) <= tolerance).any()),
+        raw=True
+    ).fillna(0).astype(int)
+
+def RejectionBlock(df, wick_ratio=2.0):
+    body = (df["Close"] - df["Open"]).abs()
+
+    upper = df["High"] - df[["Open","Close"]].max(axis=1)
+    lower = df[["Open","Close"]].min(axis=1) - df["Low"]
+
+    return ((upper > body * wick_ratio) |
+            (lower > body * wick_ratio)).astype(int)
+
+def BullishOB(df, multiplier=1.5):
+    body = (df["Close"] - df["Open"]).abs()
+    next_body = body.shift(-1)
+
+    bearish = df["Close"] < df["Open"]
+    next_bullish = df["Close"].shift(-1) > df["Open"].shift(-1)
+
+    return (bearish &
+            next_bullish &
+            (next_body >= body * multiplier)).astype(int)
+
+def BearishOB(df, multiplier=1.5):
+    body = (df["Close"] - df["Open"]).abs()
+    next_body = body.shift(-1)
+
+    bullish = df["Close"] > df["Open"]
+    next_bearish = df["Close"].shift(-1) < df["Open"].shift(-1)
+
+    return (bullish &
+            next_bearish &
+            (next_body >= body * multiplier)).astype(int)
+
+def BullishFVG(df):
+    return (df["Low"].shift(-1) > df["High"].shift(1)).astype(int)
+
+def BearishFVG(df):
+    return (df["High"].shift(-1) < df["Low"].shift(1)).astype(int)
+
+def BullishMB(df, multiplier=1.5):
+    body = (df["Close"] - df["Open"]).abs()
+
+    bearish = df["Close"] < df["Open"]
+    next_bullish = df["Close"].shift(-1) > df["Open"].shift(-1)
+    displacement = body.shift(-1) >= body * multiplier
+
+    ob = bearish & next_bullish & displacement
+
+    ob_high = df["High"].where(ob).ffill()
+    ob_low = df["Low"].where(ob).ffill()
+
+    return ((df["Low"] <= ob_high) &
+            (df["High"] >= ob_low)).astype(int)
+
+def BearishMB(df, multiplier=1.5):
+    body = (df["Close"] - df["Open"]).abs()
+
+    bullish = df["Close"] > df["Open"]
+    next_bearish = df["Close"].shift(-1) < df["Open"].shift(-1)
+    displacement = body.shift(-1) >= body * multiplier
+
+    ob = bullish & next_bearish & displacement
+
+    ob_high = df["High"].where(ob).ffill()
+    ob_low = df["Low"].where(ob).ffill()
+
+    return ((df["Low"] <= ob_high) &
+            (df["High"] >= ob_low)).astype(int)
+
 def add_indicators(df):
     df['adx'], df['+di'], df['-di'] = ADX(df)
 
@@ -153,7 +243,23 @@ def add_indicators(df):
     df['EMA21'] = EMA(df, 21)
     df['EMA_DIFF'] = df['EMA7'] - df['EMA21']
 
-    df = df[["Open", "High", "Low", "Close", "k", "k_smooth", "adx", "+di", "-di", "EMA7", "EMA21", "EMA_DIFF"]].copy()
+    df["indecision"] = Indecision(df)
+    df["rb"] = RejectionBlock(df)
+
+    df["bullish_ob"] = BullishOB(df)
+    df["bearish_ob"] = BearishOB(df)
+
+    df["bullish_fvg"] = BullishFVG(df)
+    df["bearish_fvg"] = BearishFVG(df)
+
+    df["eqh"] = EQH(df)
+    df["eql"] = EQL(df)
+
+    df["bearish_mb"] = BearishMB(df)
+    df["bullish_mb"] = BullishMB(df)
+
+    df = df[["Open", "High", "Low", "Close", "k", "k_smooth", "adx", "+di", "-di", "EMA7", "EMA21", "EMA_DIFF",
+            "indecision", "rb", "bullish_ob", "bearish_ob", "bullish_fvg", "bearish_fvg", "eqh", "eql", "bearish_mb", "bullish_mb"]].copy()
     # df = df[["Open", "High", "Low", "Close", "EMA_crossover", "macd_zone", "macd_line", "macd_signal", "macd_line_diff", "macd_signal_diff", "macd_line_slope", "macd_signal_line_slope" , "macd_osma", "macd_crossover", "bb_sma", "bb_upper", "bb_lower", "RSI_zone", "ADX_zone", "+DI_val", "-DI_val", "ATR", "order_block_type"]].copy()
 
     df.dropna(inplace=True)
@@ -498,21 +604,17 @@ class LSTMPPOAgent:
         if not os.path.exists("LSTM-PPO-saves"):
             return
 
-        files = sorted(
-            [
-                f for f in os.listdir("LSTM-PPO-saves")
-                if f.endswith(".checkpoint.pt")
-                and symbol in f
-            ]
-        )
+        files = [
+            os.path.join("LSTM-PPO-saves", f)
+            for f in os.listdir("LSTM-PPO-saves")
+            if f.endswith(".checkpoint.pt")
+            and symbol in f
+        ]
 
         if not files:
             return
 
-        latest = os.path.join(
-            "LSTM-PPO-saves",
-            files[-1]
-        )
+        latest = max(files, key=os.path.getmtime)
 
         checkpoint = torch.load(
             latest,
@@ -527,6 +629,8 @@ class LSTMPPOAgent:
             self.optimizer.load_state_dict(
                 checkpoint["optimizer"]
             )
+
+        print(f"Loaded checkpoint: {latest}")
 
 class WinRateKNN:
     def __init__(self, symbol, k=10):
@@ -727,7 +831,7 @@ def train_bot(symbol="XAUUSD"):
     df = load_last_mb_xauusd()
     df = add_indicators(df)
 
-    SEQ_LEN = 12 * 3
+    SEQ_LEN = 12 * 8
 
     FEATURES = [
         "Open",
@@ -741,7 +845,17 @@ def train_bot(symbol="XAUUSD"):
         "-di",
         "EMA7",
         "EMA21",
-        "EMA_DIFF"
+        "EMA_DIFF",
+        "indecision",
+        "rb",
+        "bullish_ob",
+        "bearish_ob",
+        "bullish_fvg",
+        "bearish_fvg",
+        "eqh",
+        "eql",
+        "bearish_mb",
+        "bullish_mb"
     ]
 
     agent = LSTMPPOAgent(
@@ -752,12 +866,14 @@ def train_bot(symbol="XAUUSD"):
 
     # knn = WinRateKNN(symbol)
 
+    """
     try:
         agent.loadcheckpoint(symbol)
         # knn.load()
         print(f"[{symbol}] Loaded checkpoint")
     except:
         print(f"[{symbol}] Starting fresh")
+    """
 
     save_counter = 0
 
@@ -821,7 +937,7 @@ def train_bot(symbol="XAUUSD"):
         low = current["Low"]
         # SL_PIPS = round(current_price * 0.00125 * 10, 0)
         SL_PIPS = 50
-        TP1_PIPS = round(SL_PIPS * 0.2, 0)
+        TP1_PIPS = round(SL_PIPS * 0.26, 0)
         # TP2_PIPS = round(SL_PIPS * 2, 0)
         # TP3_PIPS = round(SL_PIPS * 3, 0)
         # TP4_PIPS = round(SL_PIPS * 4, 0)
@@ -862,8 +978,8 @@ def train_bot(symbol="XAUUSD"):
         # OPEN LONG
         # ==============================================================
 
-        if action == 1 and not in_position and df["+di"].iloc[i] > df["-di"].iloc[i] and df["EMA_DIFF"].iloc[i] > 0 and df["k"].iloc[i] < 80:
-
+        # if action == 1 and not in_position and df["+di"].iloc[i] > df["-di"].iloc[i] and df["EMA_DIFF"].iloc[i] > 0 and df["k"].iloc[i] < 80:
+        if action == 1 and not in_position:
             in_position = True
             position_type = "long"
 
@@ -903,8 +1019,8 @@ def train_bot(symbol="XAUUSD"):
         # OPEN SHORT
         # ==============================================================
 
-        elif action == 2 and not in_position and df["-di"].iloc[i] > df["+di"].iloc[i] and df["EMA_DIFF"].iloc[i] < 0 and df["k"].iloc[i] > 20:
-
+        # elif action == 2 and not in_position and df["-di"].iloc[i] > df["+di"].iloc[i] and df["EMA_DIFF"].iloc[i] < 0 and df["k"].iloc[i] > 20:
+        elif action == 2 and not in_position:
             in_position = True
             position_type = "short"
 
@@ -1198,14 +1314,7 @@ def train_bot(symbol="XAUUSD"):
 
         if save_counter % 1440 == 0:
         # if len(agent.trajectory) >= 512:
-            print(
-                f"[{symbol}] "
-                f"[INFO] Training PPO on step "
-                f"{save_counter}..."
-            )
 
-            agent.train()
-            agent.savecheckpoint(symbol)
             # knn._fit()
             # knn.save()
 
@@ -1267,6 +1376,14 @@ def train_bot(symbol="XAUUSD"):
 
                 trade_returns = []
 
+            print(
+                f"[{symbol}] "
+                f"[INFO] Training PPO on step "
+                f"{save_counter}..."
+            )
+            agent.train()
+            agent.savecheckpoint(symbol)
+
     # ==============================================================
     # FINAL TRAINING
     # ==============================================================
@@ -1291,7 +1408,7 @@ def open_long(symbol, lot_size):
 
     sl = entry - 5
 
-    tp1 = entry + 1.12
+    tp1 = entry + 1.3
     # tp2 = entry + 10
     # tp3 = entry + 15
     # tp4 = entry + 20
@@ -1327,7 +1444,7 @@ def open_short(symbol, lot_size):
 
     sl = entry + 5
 
-    tp1 = entry - 1.12
+    tp1 = entry - 1.3
     # tp2 = entry - 10
     # tp3 = entry - 15
     # tp4 = entry - 20
@@ -1438,7 +1555,7 @@ def manage_positions(symbol, SL_MOVE_BUFFER):
                 move_all_stops(symbol, pos.tp)
 
 def test_bot(symbol="XAUUSD"):
-    SEQ_LEN = 12 * 3
+    SEQ_LEN = 12 * 8
     
     mt5.initialize()
     account = mt5.account_info()
@@ -1447,7 +1564,7 @@ def test_bot(symbol="XAUUSD"):
     #     print(mt5.last_error())
     #     return
     balance = account.balance
-    RISK = 0.02
+    RISK = 0.005
     # risk_per_position = max(balance * RISK / 500 / 4, 0.01)
 
     # tick = mt5.symbol_info_tick(symbol)
@@ -1472,7 +1589,17 @@ def test_bot(symbol="XAUUSD"):
         "-di",
         "EMA7",
         "EMA21",
-        "EMA_DIFF"
+        "EMA_DIFF",
+        "indecision",
+        "rb",
+        "bullish_ob",
+        "bearish_ob",
+        "bullish_fvg",
+        "bearish_fvg",
+        "eqh",
+        "eql",
+        "bearish_mb",
+        "bullish_mb"
     ]
 
     # last_m15 = None
@@ -1535,15 +1662,16 @@ def test_bot(symbol="XAUUSD"):
         now = datetime.now()
 
         seconds_until_next_5m = (
-            (5 - now.minte % 5) * 60
+            (5 - now.minute % 5) * 60
             - now.second
             - now.microsecond / 1_000_000
         )
-
+        # print(f"sleeping {seconds_until_next_5m:.0f} seconds, current time: {datetime.now()}")
         if seconds_until_next_5m <= 0:
             seconds_until_next_5m += 300
 
         time.sleep(seconds_until_next_5m)
+        # print(f"slept {seconds_until_next_5m:.0f} seconds, current time: {datetime.now()}")
 
         tick = mt5.symbol_info_tick(symbol)
         # SL_PIPS = round(tick.bid * 0.00125 * 10, 0)
@@ -1675,8 +1803,13 @@ def test_bot(symbol="XAUUSD"):
             action, _, _ = agent.select_action(
                 state_seq,
                 open_pos > 0,
-                training=False
+                training=True
             )
+
+            if df["adx"].iloc[-1] < 20:
+                action = 0
+
+            # print(f"action: {action}")
 
             # ==================================================
             # OPEN NEW TRADE
@@ -1693,22 +1826,22 @@ def test_bot(symbol="XAUUSD"):
                 #     0.01
                 # )
 
-                if action == 1 and df["adx"].iloc[-1] > 20 and df["+di"].iloc[-1] > df["-di"].iloc[-1] and df["EMA_DIFF"].iloc[-1] > 0 and df["k"].iloc[-1] < 80:
-
-                    # print(
-                    #     f"[{symbol}] PPO BUY"
-                    # )
+                # if action == 1 and df["adx"].iloc[-1] > 20 and df["+di"].iloc[-1] > df["-di"].iloc[-1] and df["EMA_DIFF"].iloc[-1] > 0 and df["k"].iloc[-1] < 80:
+                if action == 1:
+                    print(
+                        f"[{symbol}] PPO BUY"
+                    )
 
                     open_long(
                         symbol,
                         risk_per_position
                     )
 
-                elif action == 2 and df["adx"].iloc[-1] > 20 and df["-di"].iloc[-1] > df["+di"].iloc[-1] and df["EMA_DIFF"].iloc[-1] < 0 and df["k"].iloc[-1] > 20:
-
-                    # print(
-                    #     f"[{symbol}] PPO SELL"
-                    # )
+                # elif action == 2 and df["adx"].iloc[-1] > 20 and df["-di"].iloc[-1] > df["+di"].iloc[-1] and df["EMA_DIFF"].iloc[-1] < 0 and df["k"].iloc[-1] > 20:
+                elif action == 2:
+                    print(
+                        f"[{symbol}] PPO SELL"
+                    )
 
                     open_short(
                         symbol,
@@ -1721,7 +1854,188 @@ def test_bot(symbol="XAUUSD"):
                 #         f"[{symbol}] PPO HOLD"
                 #     )
 
+CSV_FILE = "XAU_5m_data.csv"
+
+def get_last_date():
+
+    if not os.path.exists(CSV_FILE):
+        return None
+
+    df = pd.read_csv(
+        CSV_FILE,
+        sep=";"
+    )
+
+    if df.empty:
+        return None
+
+    return pd.to_datetime(
+        df["Date"].iloc[-1]
+    )
+
+def download_xauusd_data():
+
+    last_date = get_last_date()
+
+    if (
+        last_date is not None
+        and (
+            datetime.now().date()
+            - last_date.date()
+        ).days <= 90
+    ):
+
+        print(
+            "Data already up to date."
+        )
+
+        return None
+
+    if last_date is None:
+
+        start_date = (
+            datetime.now()
+            - timedelta(days=365 * 5)
+        ).strftime(
+            "%Y-%m-%d"
+        )
+
+    else:
+
+        start_date = (
+            last_date
+            - timedelta(days=1)
+        ).strftime(
+            "%Y-%m-%d"
+        )
+
+    end_date = (
+        datetime.now()
+        - timedelta(days=1)
+    ).strftime(
+        "%Y-%m-%d"
+    )
+
+    print(
+        f"Downloading "
+        f"{start_date} -> {end_date}"
+    )
+
+    subprocess.run(
+        [
+            # "npx",
+            "dukascopy-node",
+            "-i",
+            "xauusd",
+            "-from",
+            start_date,
+            "-to",
+            end_date,
+            "-t",
+            "m5",
+            "-f",
+            "csv"
+        ],
+        check=True
+    )
+
+    files = [
+        f
+        for f in os.listdir(".")
+        if f.startswith("xauusd")
+        and f.endswith(".csv")
+    ]
+
+    if not files:
+
+        raise FileNotFoundError(
+            "No Dukascopy CSV was downloaded."
+        )
+
+    return max(
+        files,
+        key=os.path.getmtime
+    )
+
+def append_xauusd_data(downloaded_file):
+
+    if downloaded_file is None:
+        return
+
+    new_df = pd.read_csv(
+        downloaded_file
+    )
+
+    new_df.rename(
+        columns={
+            "timestamp": "Date",
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume"
+        },
+        inplace=True
+    )
+
+    if os.path.exists(CSV_FILE):
+
+        old_df = pd.read_csv(
+            CSV_FILE,
+            sep=";"
+        )
+
+        df = pd.concat(
+            [
+                old_df,
+                new_df
+            ],
+            ignore_index=True
+        )
+
+    else:
+
+        df = new_df
+
+    df.drop_duplicates(
+        subset=["Date"],
+        keep="last",
+        inplace=True
+    )
+
+    df.sort_values(
+        "Date",
+        inplace=True
+    )
+
+    df.to_csv(
+        CSV_FILE,
+        sep=";",
+        index=False
+    )
+
+    os.remove(
+        downloaded_file
+    )
+
+    print(
+        f"Saved "
+        f"{len(df)} candles "
+        f"to {CSV_FILE}"
+    )
+
+def update_xauusd_data():
+
+    downloaded_file = (
+        download_xauusd_data()
+    )
+
+    append_xauusd_data(
+        downloaded_file
+    )
+
 def main():
+    # update_xauusd_data()
     train_bot("XAUUSD")
     
     # test_bot(symbol="XAUUSD-VIP")
