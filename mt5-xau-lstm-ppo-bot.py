@@ -1907,7 +1907,7 @@ def test_bot(symbol="XAUUSD"):
                 # elif action == 2 and df["adx"].iloc[-1] > 20 and df["-di"].iloc[-1] > df["+di"].iloc[-1] and df["EMA_DIFF"].iloc[-1] < 0 and df["k"].iloc[-1] > 20:
                 # elif action == 2 and df["buy_score"].iloc[-1] < df["sell_score"].iloc[-1]:
                 # elif action == 2 and df["EMA7"].iloc[-1] < df["EMA21"].iloc[-1] and df["k"].iloc[-1] > 20:
-                elif mt5_action == 2:
+                elif action == 2:
                     """
                     if df["below_vwap"].iloc[-1] == 1:
                         position_multiplier = 2
