@@ -95,6 +95,19 @@ Example metrics during training:
 
 These figures are training statistics only and are not guarantees of future performance.
 
+### Quarterly stats
+
+|                     Quarter | Avg Weekly R |   Avg PF | Avg Max DD |    Avg RF |
+| --------------------------: | -----------: | -------: | ---------: | --------: |
+|             Q1 (Weeks 1–13) |    **6.20R** | **1.10** |  **8.80R** |  **2.04** |
+|            Q2 (Weeks 14–26) |    **7.39R** | **1.12** |  **9.80R** |  **2.25** |
+|            Q3 (Weeks 27–39) |   **16.89R** | **1.25** |  **8.14R** |  **5.42** |
+|            Q4 (Weeks 40–52) |   **43.73R** | **1.29** | **10.81R** |  **9.20** |
+|            Q5 (Weeks 53–65) |   **36.54R** | **1.38** |  **8.94R** |  **8.72** |
+|            Q6 (Weeks 66–78) |   **75.07R** | **1.38** |  **8.62R** | **19.42** |
+|            Q7 (Weeks 79–91) |  **164.37R** | **1.82** |  **7.23R** | **54.69** |
+| Q8 (Weeks 92–102, 11 weeks) |  **126.55R** | **1.49** |  **8.76R** | **34.54** |
+
 ---
 
 ## Requirements
