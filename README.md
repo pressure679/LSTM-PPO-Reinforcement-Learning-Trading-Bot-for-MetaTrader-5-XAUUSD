@@ -26,7 +26,7 @@ The bot automatically detects:
 - Order Blocks (OB)
 - Mitigated Order Blocks
 - Breaker Blocks
-- Market Blocks (MB)
+- Mitigation Blocks (MB)
 - Rejection Blocks (RB)
 - Fair Value Gaps (FVG)
 - Inverse Fair Value Gaps (IFVG)
