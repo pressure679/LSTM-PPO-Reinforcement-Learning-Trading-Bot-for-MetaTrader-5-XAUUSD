@@ -257,13 +257,23 @@ by **1m HalfTrend**. The order-block and PDH/PDL/Asia-session indicators
 `AsiaHighDistance`/`AsiaLowDistance`) are ported from `bot.py`'s own — see "Notes /
 interpretation choices" below for the two adaptations made porting them.
 
-**2. PDH/PDL + Asia high/low break, retest and reversal** (`poi_reversal`): a candidate
-fires in whichever direction the 1m HalfTrend currently points, on any bar where price
-is within `POI_REACH_PIPS` (30) of the previous day's high, the previous day's low, the
-current Asia session's high, or its low. HalfTrend's live state stands in for whichever
-of breakout/retest/reversal is actually happening at the level — continuing through it
-trades as a breakout, flipping at it trades as a reversal — rather than the code
-classifying the three separately.
+**2. PDH/PDL + Asia high/low break, retest and reversal** (`poi_reversal`, see
+`_poi_candidate()`): a candidate fires in whichever direction the 1m HalfTrend
+currently points, on any bar where price is within `POI_REACH_PIPS` (30) of the
+previous day's high, the previous day's low, the current Asia session's high, or its
+low. HalfTrend's live state stands in for whether it's a breakout or a reversal at the
+level (`POI_LEVEL_KINDS`) — HalfTrend continuing *through* a resistance level (PDH,
+Asia high) or a support level (PDL, Asia low) the other way is a breakout; going the
+*other* way right at the level is a reversal — rather than the code classifying
+breakout/retest/reversal as three separate signals.
+
+**Capped at one trade per level per breakout-or-reversal per calendar day** — 8
+combinations total (PDH breakout, PDH reversal, PDL breakout, PDL reversal, and the
+same pair for Asia high and Asia low). A PDH breakout and a PDH reversal can each fire
+once on the same day, but a second PDH breakout that day can't — regardless of whether
+the first one won or lost. The cap is spent only when a trade off that (level, event)
+actually opens (a candidate the GBDT filter or the agent turns down doesn't spend it),
+and resets at midnight (calendar date, not a trading-session boundary).
 
 **3. OB mitigation** (`ob_mitigation`): a candidate fires when the 1m HalfTrend
 *flips* direction (not just agrees, per spec's "halftrend reversal") on a bar that's

@@ -47,17 +47,24 @@ _add_m1_levels(), _level_signal_columns()), sharing a 1:2 RR (the same
 50-pip SL / a 100-pip TP = LEVEL_TP_PIPS), and both gated by 1m
 HalfTrend:
 
-  2. PDH/PDL + Asia high/low break, retest and reversal (poi_reversal):
-     a candidate fires in whichever direction the 1m HalfTrend
-     currently points, on any bar where price is within
-     POI_REACH_PIPS (30) of the previous day's high, the previous
-     day's low, the current Asia session's high, or its low (PDH/PDL/
-     Asia-high/Asia-low distance, ported from bot.py's own
+  2. PDH/PDL + Asia high/low break, retest and reversal (poi_reversal,
+     see _poi_candidate()): a candidate fires in whichever direction
+     the 1m HalfTrend currently points, on any bar where price is
+     within POI_REACH_PIPS (30) of the previous day's high, the
+     previous day's low, the current Asia session's high, or its low
+     (PDH/PDL/Asia-high/Asia-low distance, ported from bot.py's own
      PDHDistance/PDLDistance/AsiaHighDistance/AsiaLowDistance).
-     HalfTrend's live state stands in for whichever of
-     breakout/retest/reversal is actually happening at the level --
-     continuing through it trades as a breakout, flipping at it trades
-     as a reversal -- rather than classifying the three separately.
+     HalfTrend's live state stands in for whether it's a breakout or a
+     reversal at the level (POI_LEVEL_KINDS: HalfTrend continuing
+     *through* a resistance level -- PDH/Asia high -- or a support
+     level -- PDL/Asia low -- the other way is a breakout; going the
+     *other* way right at the level is a reversal), rather than
+     classifying breakout/retest/reversal as three separate signals.
+     Capped at one trade per (level, breakout-or-reversal) per
+     calendar day -- 8 combinations total (PDH breakout, PDH reversal,
+     PDL breakout, PDL reversal, same for Asia high/low) -- so e.g. a
+     PDH breakout and a PDH reversal can each fire once the same day,
+     but a second PDH breakout that day can't, regardless of outcome.
 
   3. OB mitigation (ob_mitigation): a candidate fires when the 1m
      HalfTrend *flips* direction (not just agrees) on a bar that's
@@ -1414,38 +1421,38 @@ def _signal_columns(df):
     return bull_signal, bear_signal
 
 
-def _level_signal_columns(df):
-    """Candidate signals for the two 1m-HalfTrend-gated level
-    strategies (both need M1_LEVEL_FEATURES from _add_m1_levels()):
+# PDH/PDL are resistance/support the same way every day; Asia high/low
+# are resistance/support for that day's session. HalfTrend continuing
+# *through* a resistance level (bullish) or a support level (bearish)
+# is a breakout; HalfTrend going the *other* way right at the level
+# (bearish at resistance, bullish at support) is a rejection/reversal.
+# Order here is also _poi_candidate()'s fixed priority when more than
+# one level is in reach on the same bar.
+POI_LEVEL_KINDS = (
+    ("pdh", "resistance"),
+    ("pdl", "support"),
+    ("asia_high", "resistance"),
+    ("asia_low", "support"),
+)
 
-    - poi_bull/poi_bear ("PDH/PDL + Asia high/low break, retest and
-      reversal"): the 1m HalfTrend's current direction, on any bar
-      where price is within POI_REACH_PIPS of any of the four levels
-      (PDH, PDL, Asia high, Asia low). HalfTrend's live state stands in
-      for whichever of breakout/retest/reversal is actually happening
-      at the level -- continuing through it trades as a breakout,
-      flipping at it trades as a reversal -- rather than classifying
-      the three separately.
-    - ob_bull/ob_bear ("OB mitigation"): the 1m HalfTrend *flipping*
-      direction this bar (not just agreeing, per spec's "halftrend
-      reversal") on a bar that's also mitigating (within
-      POI_REACH_PIPS of, via OBMitigation()'s own threshold) a
-      same-direction order block -- a bullish/demand OB mitigated with
-      HalfTrend flipping up is a reversal long, a bearish/supply OB
-      mitigated with HalfTrend flipping down is a reversal short.
+
+def _level_signal_columns(df):
+    """ob_bull/ob_bear ("OB mitigation"): the 1m HalfTrend *flipping*
+    direction this bar (not just agreeing, per spec's "halftrend
+    reversal") on a bar that's also mitigating (within POI_REACH_PIPS
+    of, via OBMitigation()'s own threshold) a same-direction order
+    block -- a bullish/demand OB mitigated with HalfTrend flipping up
+    is a reversal long, a bearish/supply OB mitigated with HalfTrend
+    flipping down is a reversal short.
+
+    (The PDH/PDL/Asia high-low strategy's candidate selection lives in
+    _poi_candidate() instead of here, since -- unlike this one -- it
+    needs per-bar state (at most one trade per level per
+    breakout-or-reversal event per day) that a pure vectorized column
+    can't express.)
     """
     bull_ht = df["1m_bullish_halftrend"].astype(bool)
     bear_ht = df["1m_bearish_halftrend"].astype(bool)
-
-    near_poi = (
-        (df["1m_pdh_dist"].abs() <= POI_REACH_PIPS)
-        | (df["1m_pdl_dist"].abs() <= POI_REACH_PIPS)
-        | (df["1m_asia_high_dist"].abs() <= POI_REACH_PIPS)
-        | (df["1m_asia_low_dist"].abs() <= POI_REACH_PIPS)
-    )
-
-    poi_bull = bull_ht & near_poi
-    poi_bear = bear_ht & near_poi
 
     flip_bull = bull_ht & ~bull_ht.shift(1).fillna(False)
     flip_bear = bear_ht & ~bear_ht.shift(1).fillna(False)
@@ -1453,34 +1460,94 @@ def _level_signal_columns(df):
     ob_bull = flip_bull & df["1m_bullish_ob_mitigation"].astype(bool)
     ob_bear = flip_bear & df["1m_bearish_ob_mitigation"].astype(bool)
 
-    return poi_bull, poi_bear, ob_bull, ob_bear
+    return ob_bull, ob_bear
+
+
+def _poi_candidate(bull_ht, bear_ht, near_pdh, near_pdl, near_asia_high, near_asia_low, used_today):
+    """Picks a PDH/PDL/Asia high/low candidate for the current bar --
+    "PDH/PDL + Asia high/low break, retest and reversal", per spec, at
+    most once per (level, breakout-or-reversal) per calendar day. HalfTrend's
+    live state stands in for whichever of breakout/retest/reversal is
+    actually happening at the level (see POI_LEVEL_KINDS) rather than
+    classifying the three separately, same as before -- what's new is
+    that each (level, event) combination -- e.g. "pdh breakout", "pdh
+    reversal", same for pdl/asia_high/asia_low, 8 combinations total --
+    can only produce a candidate once per day; `used_today` is a set of
+    "{level}_{event}" keys already spent today, and it's the caller's
+    job to add the key this returns to it once a trade off it actually
+    opens (not just whenever the candidate fires -- a candidate that
+    never gets taken, e.g. rejected by the GBDT filter, doesn't spend
+    the day's slot). Levels are checked in POI_LEVEL_KINDS order;
+    ties (more than one level in reach at once) go to the first.
+    Returns (action, key) or (HOLD, None)."""
+    near_by_level = {
+        "pdh": near_pdh, "pdl": near_pdl,
+        "asia_high": near_asia_high, "asia_low": near_asia_low,
+    }
+
+    for level, kind in POI_LEVEL_KINDS:
+        if not near_by_level[level]:
+            continue
+
+        if kind == "resistance":
+            if bull_ht:
+                action, event = BUY, "breakout"
+            elif bear_ht:
+                action, event = SELL, "reversal"
+            else:
+                continue
+        else:  # support
+            if bear_ht:
+                action, event = SELL, "breakout"
+            elif bull_ht:
+                action, event = BUY, "reversal"
+            else:
+                continue
+
+        key = f"{level}_{event}"
+        if key in used_today:
+            continue
+
+        return action, key
+
+    return HOLD, None
 
 
 def _select_candidate(
     bull_stoch, bear_stoch, long_htf_ok, short_htf_ok,
-    poi_bull, poi_bear, ob_bull, ob_bear,
+    bull_ht, bear_ht, near_pdh, near_pdl, near_asia_high, near_asia_low, poi_used_today,
+    ob_bull, ob_bear,
 ):
-    """Picks a candidate (action, tp_pips, strategy_name) for the
-    current bar across all three entry strategies, in a fixed priority
-    order: stoch/%R zone-breakout first, then the PDH/PDL/Asia-level
-    reversal, then OB mitigation. More than one firing on the same bar
-    (in the same or opposite directions) is rare given how differently
-    each triggers, and resolved by this order rather than reconciled --
-    the agent still decides whether to actually take whatever candidate
-    wins. Returns (HOLD, TP_PIPS, None) if nothing fires."""
+    """Picks a candidate (action, tp_pips, strategy_name, poi_key) for
+    the current bar across all three entry strategies, in a fixed
+    priority order: stoch/%R zone-breakout first, then the
+    PDH/PDL/Asia-level reversal (itself further gated by
+    _poi_candidate()'s once-per-level-per-event-per-day cap), then OB
+    mitigation. More than one firing on the same bar (in the same or
+    opposite directions) is rare given how differently each triggers,
+    and resolved by this order rather than reconciled -- the agent
+    still decides whether to actually take whatever candidate wins.
+    poi_key is only meaningful when strategy_name == "poi_reversal";
+    the caller adds it to poi_used_today once (and only once) a trade
+    off it actually opens. Returns (HOLD, TP_PIPS, None, None) if
+    nothing fires."""
     if bull_stoch and long_htf_ok:
-        return BUY, TP_PIPS, "stoch_breakout"
+        return BUY, TP_PIPS, "stoch_breakout", None
     if bear_stoch and short_htf_ok:
-        return SELL, TP_PIPS, "stoch_breakout"
-    if poi_bull:
-        return BUY, LEVEL_TP_PIPS, "poi_reversal"
-    if poi_bear:
-        return SELL, LEVEL_TP_PIPS, "poi_reversal"
+        return SELL, TP_PIPS, "stoch_breakout", None
+
+    poi_action, poi_key = _poi_candidate(
+        bull_ht, bear_ht, near_pdh, near_pdl, near_asia_high, near_asia_low, poi_used_today
+    )
+    if poi_action != HOLD:
+        return poi_action, LEVEL_TP_PIPS, "poi_reversal", poi_key
+
     if ob_bull:
-        return BUY, LEVEL_TP_PIPS, "ob_mitigation"
+        return BUY, LEVEL_TP_PIPS, "ob_mitigation", None
     if ob_bear:
-        return SELL, LEVEL_TP_PIPS, "ob_mitigation"
-    return HOLD, TP_PIPS, None
+        return SELL, LEVEL_TP_PIPS, "ob_mitigation", None
+
+    return HOLD, TP_PIPS, None, None
 
 
 def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
@@ -1503,11 +1570,14 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
     df["bull_signal"] = bull_signal
     df["bear_signal"] = bear_signal
 
-    poi_bull, poi_bear, ob_bull, ob_bear = _level_signal_columns(df)
-    df["poi_bull"] = poi_bull
-    df["poi_bear"] = poi_bear
+    ob_bull, ob_bear = _level_signal_columns(df)
     df["ob_bull"] = ob_bull
     df["ob_bear"] = ob_bear
+
+    df["near_pdh"] = df["1m_pdh_dist"].abs() <= POI_REACH_PIPS
+    df["near_pdl"] = df["1m_pdl_dist"].abs() <= POI_REACH_PIPS
+    df["near_asia_high"] = df["1m_asia_high_dist"].abs() <= POI_REACH_PIPS
+    df["near_asia_low"] = df["1m_asia_low_dist"].abs() <= POI_REACH_PIPS
 
     tag = model_tag(symbol)
 
@@ -1545,10 +1615,15 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
     bear_signal_arr = df["bear_signal"].to_numpy()
     long_htf_ok_arr = df["long_htf_ok"].to_numpy()
     short_htf_ok_arr = df["short_htf_ok"].to_numpy()
-    poi_bull_arr = df["poi_bull"].to_numpy()
-    poi_bear_arr = df["poi_bear"].to_numpy()
+    bull_ht_arr = df["1m_bullish_halftrend"].to_numpy().astype(bool)
+    bear_ht_arr = df["1m_bearish_halftrend"].to_numpy().astype(bool)
+    near_pdh_arr = df["near_pdh"].to_numpy()
+    near_pdl_arr = df["near_pdl"].to_numpy()
+    near_asia_high_arr = df["near_asia_high"].to_numpy()
+    near_asia_low_arr = df["near_asia_low"].to_numpy()
     ob_bull_arr = df["ob_bull"].to_numpy()
     ob_bear_arr = df["ob_bear"].to_numpy()
+    date_arr = df.index.date
 
     save_counter = 0
     in_position = False
@@ -1557,6 +1632,11 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
     entry_state = None
     entry_strategy = None
     mult = 1.0
+
+    # poi_reversal's once-per-(level, breakout-or-reversal)-per-day cap
+    # -- see _poi_candidate(). Reset whenever the calendar date changes.
+    poi_used_today = set()
+    current_poi_day = None
 
     trade_returns = []
     strategy_counts = {"stoch_breakout": 0, "poi_reversal": 0, "ob_mitigation": 0}
@@ -1591,6 +1671,10 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
 
                 action, logprob, value = result
 
+                if date_arr[i] != current_poi_day:
+                    current_poi_day = date_arr[i]
+                    poi_used_today = set()
+
                 # Candidate direction (and which of the three
                 # strategies it comes from, and that strategy's own
                 # TP) comes from the deterministic technical stack, not
@@ -1598,10 +1682,12 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
                 # deciding whether to *take* a signal that already
                 # exists (mirrors bot.py's HalfTrend-redirect:
                 # technicals pick direction, the agent times entries).
-                candidate, candidate_tp_pips, candidate_strategy = _select_candidate(
+                candidate, candidate_tp_pips, candidate_strategy, candidate_poi_key = _select_candidate(
                     bull_signal_arr[i], bear_signal_arr[i],
                     long_htf_ok_arr[i], short_htf_ok_arr[i],
-                    poi_bull_arr[i], poi_bear_arr[i],
+                    bull_ht_arr[i], bear_ht_arr[i],
+                    near_pdh_arr[i], near_pdl_arr[i], near_asia_high_arr[i], near_asia_low_arr[i],
+                    poi_used_today,
                     ob_bull_arr[i], ob_bear_arr[i],
                 )
 
@@ -1645,6 +1731,8 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
                     tp_price = entry_price + candidate_tp_pips * PIP_VALUE
 
                     strategy_counts[entry_strategy] += 1
+                    if entry_strategy == "poi_reversal":
+                        poi_used_today.add(candidate_poi_key)
 
                     agent.store_transition(state_seq, action, logprob, value, pnl, done)
 
@@ -1660,6 +1748,8 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
                     tp_price = entry_price - candidate_tp_pips * PIP_VALUE
 
                     strategy_counts[entry_strategy] += 1
+                    if entry_strategy == "poi_reversal":
+                        poi_used_today.add(candidate_poi_key)
 
                     agent.store_transition(state_seq, action, logprob, value, pnl, done)
 
@@ -1889,6 +1979,11 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
     last_trading_date = df.index[-1].date()
     day_start_balance = mt5.account_info().balance
 
+    # poi_reversal's once-per-(level, breakout-or-reversal)-per-day cap
+    # -- see _poi_candidate(). Reset whenever the calendar date changes.
+    poi_used_today = set()
+    current_poi_day = last_trading_date
+
     # ==========================================================
     # MAIN LOOP
     # ==========================================================
@@ -1963,20 +2058,21 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
         )
 
         # PDH/PDL + Asia high/low reversal candidate: 1m HalfTrend's
-        # current direction within POI_REACH_PIPS of any of the four
-        # levels -- same logic as _level_signal_columns()'s poi_bull/
-        # poi_bear, evaluated on just the latest bar here.
+        # current direction within POI_REACH_PIPS of one of the four
+        # levels, at most once per (level, breakout-or-reversal) per
+        # day -- see _poi_candidate(), same logic as train_bot()'s.
+        current_date = current.name.date()
+        if current_date != current_poi_day:
+            current_poi_day = current_date
+            poi_used_today = set()
+
         bull_ht = bool(current["1m_bullish_halftrend"])
         bear_ht = bool(current["1m_bearish_halftrend"])
 
-        near_poi = (
-            abs(current["1m_pdh_dist"]) <= POI_REACH_PIPS
-            or abs(current["1m_pdl_dist"]) <= POI_REACH_PIPS
-            or abs(current["1m_asia_high_dist"]) <= POI_REACH_PIPS
-            or abs(current["1m_asia_low_dist"]) <= POI_REACH_PIPS
-        )
-        poi_bull = bull_ht and near_poi
-        poi_bear = bear_ht and near_poi
+        near_pdh = abs(current["1m_pdh_dist"]) <= POI_REACH_PIPS
+        near_pdl = abs(current["1m_pdl_dist"]) <= POI_REACH_PIPS
+        near_asia_high = abs(current["1m_asia_high_dist"]) <= POI_REACH_PIPS
+        near_asia_low = abs(current["1m_asia_low_dist"]) <= POI_REACH_PIPS
 
         # OB-mitigation candidate: 1m HalfTrend flipping direction this
         # bar (not just agreeing) while also mitigating a
@@ -1987,9 +2083,10 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
         ob_bull = flip_bull and bool(current["1m_bullish_ob_mitigation"])
         ob_bear = flip_bear and bool(current["1m_bearish_ob_mitigation"])
 
-        candidate, candidate_tp_pips, candidate_strategy = _select_candidate(
+        candidate, candidate_tp_pips, candidate_strategy, candidate_poi_key = _select_candidate(
             bull_signal, bear_signal, long_ok, short_ok,
-            poi_bull, poi_bear, ob_bull, ob_bear,
+            bull_ht, bear_ht, near_pdh, near_pdl, near_asia_high, near_asia_low, poi_used_today,
+            ob_bull, ob_bear,
         )
 
         # Which of the three bars applies depends on which strategy the
@@ -2041,6 +2138,9 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
 
             print(f"[{symbol}] Opening {ACTIONS[action]} via {candidate_strategy} "
                   f"(TP={candidate_tp_pips:.0f} pips, lot={lot})")
+
+            if candidate_strategy == "poi_reversal":
+                poi_used_today.add(candidate_poi_key)
 
             if action == BUY:
                 open_long(symbol, lot, SL_PIPS, candidate_tp_pips)
