@@ -5,7 +5,7 @@ agent that trades XAUUSD (gold) via MetaTrader5. One file, two modes: train agai
 historical 1-minute data, or trade live.
 
 A second, independent strategy lives in `bot_v2.py` — see
-["bot_v2.py — stoch/%R zone-breakout + HalfTrend variant"](#bot_v2py--stochr-zone-breakout--halftrend-variant)
+["bot_v2.py — algorithmic three-strategy variant"](#bot_v2py--algorithmic-three-strategy-variant)
 below.
 
 ## Requirements
@@ -193,7 +193,7 @@ Key constants (edit in-file — there's no config file):
 - `PDPOCDistance()` expects a `Volume` column; MT5's live feed only has `tick_volume`,
   which `test_bot` renames to `Volume` before calling `add_indicators`.
 
-## bot_v2.py — three-strategy LSTM-PPO variant
+## bot_v2.py — algorithmic three-strategy variant
 
 A second, independent strategy set in its own file, built the same way `bot.py` itself
 is: it *executes* bar-by-bar on **1-minute candles** (order fills, SL/TP hit detection
@@ -203,20 +203,20 @@ resampled from that same 1m data (merged back on with a `5m_`/`15m_`/`1h_`/`4h_`
 forward-filled so a bar only ever sees the most recently *closed* higher-tf candle — no
 lookahead), plus a second stack computed directly on the **1m** data itself (prefixed
 `1m_`). This is exactly `bot.py`'s own multi-timeframe merge, just run across five
-timeframes instead of two, and with a much smaller indicator stack per timeframe. Same
-agent/checkpoint/GBDT-win-rate-filter skeleton as `bot.py`, and its own save directory
-(`LSTM-PPO-saves-stoch-halftrend/`) so the two bots never collide or load each other's
-(differently-shaped) checkpoints.
+timeframes instead of two, and with a much smaller indicator stack per timeframe.
 
-Three independent entry strategies share one LSTM-PPO agent, one GBDT win-rate filter,
-and one 1m execution loop — on any bar, at most one can produce a candidate trade; see
-["Combining the three strategies"](#combining-the-three-strategies) for how ties are
-resolved.
+Unlike `bot.py`, **bot_v2.py has no learned model of any kind** — no LSTM-PPO agent, no
+GBDT win-rate filter, no checkpoints. Three purely rule-based entry strategies share one
+1m execution loop; on any bar, at most one can produce a signal, and whatever it picks
+is taken directly — see ["Combining the three strategies"](#combining-the-three-strategies)
+for the priority order used when more than one would fire at once. `--train` runs a
+single-pass backtest against historical data (there's nothing to train, so unlike
+`bot.py` it doesn't loop over the dataset repeatedly); `--test` trades live via MT5.
 
 ```bash
-python bot_v2.py --train                                # train against historical data
+python bot_v2.py --train                                # backtest against historical data
 python bot_v2.py --test --symbol XAUUSD-STDc --risk 0.01 # trade live via MT5
-python bot_v2.py --train --test --risk 0.02 --htf-mode both --min-winrate 0.4
+python bot_v2.py --train --test --risk 0.02 --htf-mode both
 ```
 
 ### Strategy 1 — stoch/%R zone-breakout (1:4 RR)
@@ -236,7 +236,7 @@ once %K > 80 OR %R > -20. Once either state has held for `ZONE_BARS` (5) consecu
 bars *of that timeframe*, that run's high/low forms a "zone" — a close breaking above
 the zone high (confirmed by %K crossing back above %K-smooth) is a bullish breakout
 signal; a close breaking below the zone low (%K crossing back below %K-smooth) is
-bearish. A candidate fires whenever **any** of the 4 analyzed timeframes signals a
+bearish. A signal fires whenever **any** of the 4 analyzed timeframes signals a
 breakout with that same timeframe's own ADX clearing `ADX_MIN` — see
 `_signal_columns()`.
 
@@ -258,7 +258,7 @@ by **1m HalfTrend**. The order-block and PDH/PDL/Asia-session indicators
 interpretation choices" below for the two adaptations made porting them.
 
 **2. PDH/PDL + Asia high/low break, retest and reversal** (`poi_reversal`, see
-`_poi_candidate()`): a candidate fires in whichever direction the 1m HalfTrend
+`_poi_candidate()`): a signal fires in whichever direction the 1m HalfTrend
 currently points, on any bar where price is within `POI_REACH_PIPS` (30) of the
 previous day's high, the previous day's low, the current Asia session's high, or its
 low. HalfTrend's live state stands in for whether it's a breakout or a reversal at the
@@ -272,10 +272,9 @@ combinations total (PDH breakout, PDH reversal, PDL breakout, PDL reversal, and 
 same pair for Asia high and Asia low). A PDH breakout and a PDH reversal can each fire
 once on the same day, but a second PDH breakout that day can't — regardless of whether
 the first one won or lost. The cap is spent only when a trade off that (level, event)
-actually opens (a candidate the GBDT filter or the agent turns down doesn't spend it),
-and resets at midnight (calendar date, not a trading-session boundary).
+actually opens, and resets at midnight (calendar date, not a trading-session boundary).
 
-**3. OB mitigation** (`ob_mitigation`): a candidate fires when the 1m HalfTrend
+**3. OB mitigation** (`ob_mitigation`): a signal fires when the 1m HalfTrend
 *flips* direction (not just agrees, per spec's "halftrend reversal") on a bar that's
 also mitigating — within that same `POI_REACH_PIPS` reach — a same-direction order
 block: a bullish/demand OB mitigated with HalfTrend flipping up is a reversal long, a
@@ -283,75 +282,33 @@ bearish/supply OB mitigated with HalfTrend flipping down is a reversal short.
 
 ### Combining the three strategies
 
-Across all three, the LSTM-PPO agent decides whether to actually take whichever
-candidate wins (or hold) — the deterministic technical stack always picks direction
-(and which strategy, and that strategy's own TP), the same "agent times entries,
-technicals pick direction" split `bot.py`'s own HalfTrend-redirect uses; the agent's 3
-actions are **0=buy, 1=sell, 2=hold** (`BUY`/`SELL`/`HOLD` in the file — note this
+On any bar, `_select_candidate()` checks the three strategies in a fixed priority
+order — stoch/%R breakout first, then the PDH/PDL/Asia-level reversal (itself further
+gated by `_poi_candidate()`'s once-per-level-per-event-per-day cap), then OB
+mitigation — and returns the first one that fires (direction, that strategy's own TP,
+and its name). More than one strategy firing on the same bar, in the same or opposite
+directions, is rare given how differently each triggers, and resolved by this order
+rather than reconciled. Whatever it returns is taken directly: there's no learned model
+downstream deciding whether to act on it, and no confidence score scaling position
+size — every trade risks the same flat `--risk` fraction of account balance regardless
+of which strategy opened it.
+
+Actions are **0=buy, 1=sell, 2=hold** (`BUY`/`SELL`/`HOLD` in the file — note this
 ordering is not the same as `bot.py`'s own agent).
-
-More than one strategy firing on the same bar (in the same or opposite directions) is
-rare given how differently each triggers, and resolved by a fixed priority order rather
-than reconciled — see `_select_candidate()`: stoch/%R breakout first, then the
-PDH/PDL/Asia-level reversal, then OB mitigation.
-
-The GBDT win-rate filter model itself is shared across all three — one filter instance,
-fed the full feature vector regardless of which strategy fired, so it learns
-per-setup-type patterns implicitly rather than needing a separate model per strategy —
-but each strategy is gated against its own min-winrate bar (see "Risk sizing" below)
-and, once through, its own risk multiplier off that same bar.
 
 ### Weekly stats
 
 Same metrics as `bot.py`'s own weekly report — trade count, PnL (pips and R-multiple),
 max drawdown, win rate, mean win/loss, average win/loss streak, Z-score, profit factor,
-recovery factor, Sharpe, Sortino — plus the three currently-active min-winrate bars
-(one per strategy), whether the GBDT filter is active yet or still bootstrapping, and a
-trades-by-strategy breakdown
+recovery factor, Sharpe, Sortino — plus a trades-by-strategy breakdown
 (`stoch=`/`poi=`/`ob=` counts) that `bot.py`'s single-strategy report has no need for.
 Unlike `bot.py`, which skips the report on a week with 5 or fewer trades, `bot_v2.py`
 prints every week regardless of trade count — including a quiet week with none at all —
-so there's never a silent gap between reports. Printed every `TRADING_WEEK_BARS`
-(1440 × 5 = one 5-day week of 1-minute bars, same definition as `bot.py`'s `save_count`)
-during `train_bot()`.
-
-### Risk sizing
-
-A buy/sell from any of the three strategies only clears the GBDT win-rate filter once
-it predicts a win rate at or above a min-winrate bar. By default (no `--min-winrate`
-passed) each **strategy has its own bar**:
-
-| Strategy | RR | Breakeven | Default bar | Source |
-|---|---|---|---|---|
-| stoch/%R breakout | 1:4 | 20% | **35.0%** | `_default_min_winrate()`: breakeven×1.1 = 22% doesn't clear the 35% floor |
-| PDH/PDL/Asia reversal (`poi_reversal`) | 1:2 | 33.3% | **45.0%** | explicit override, not formula-derived |
-| OB mitigation (`ob_mitigation`) | 1:2 | 33.3% | **36.7%** | `_default_min_winrate()`: breakeven×1.1 = 36.7% clears the floor on its own |
-
-The stoch/breakout and OB-mitigation bars come from `_default_min_winrate()`:
-`max(breakeven * 1.1, 35%)`, so neither ever drops below 35% but can still demand more
-once its own breakeven×1.1 clears that floor. `poi_reversal`'s bar is set directly
-(`POI_MIN_WINRATE_DEFAULT`) rather than from that formula, since both level strategies
-share the same 1:2 RR and would otherwise land on the identical 36.7%.
-
-Pass `--min-winrate` (for both `--train` and `--test`, e.g. `--min-winrate 0.4`) to use
-one flat number for all three instead of these defaults.
-
-Position risk scales with the filter's confidence: once active, every full 10
-percentage points its predicted win rate clears above that minimum adds one more unit
-of the base `--risk` to the position (`risk_multiplier()`) — a barely-qualifying setup
-risks the plain `--risk` amount, a strongly-favoured one risks several multiples of it
-(capped at `MAX_RISK_MULTIPLIER = 5`).
-
-### GBDT win-rate filter — `GBDTWinRateFilter`
-
-Same accumulate-then-refit XGBoost design as `bot.py`'s `WinRateModel`, refit at the
-same weekly cadence as the PPO agent, with one addition: it doesn't **gate** any trade
-until `WEEKS_BEFORE_FILTER` (5) simulated training weeks have completed
-(`weeks_trained`, persisted alongside the sample pickle) — before that it keeps
-fitting/accumulating samples in the background so it's warm by week 5, but never blocks
-a trade, so the first weeks of training aren't starved waiting on data that doesn't
-exist yet. Persisted to
-`LSTM-PPO-saves-stoch-halftrend/{symbol}-stoch-halftrend.gbdt_winrate.pkl`.
+so there's never a silent gap between reports, plus one final block for whatever's left
+in the last partial week once the backtest reaches the end of the data. Printed every
+`TRADING_WEEK_BARS` (1440 × 5 = one 5-day week of 1-minute bars, same definition as
+`bot.py`'s `save_count`) during `--train` — there's no training happening; "week" here
+is purely the backtest's own reporting cadence.
 
 ### Notes / interpretation choices
 
@@ -370,14 +327,13 @@ exist yet. Persisted to
   `(hour >= 1) | (hour <= 9)`, is a bug in `bot.py` (that OR covers nearly the entire
   day, not a session) — `bot_v2.py`'s versions use AND, matching those functions' own
   "01:00–08:59" docstring and `bot.py`'s `GetKillzone()` Asia-session convention.
-- "Add 1R to risk per +10% predicted win rate" is implemented as a risk *multiplier*
-  (1 + one extra unit of `--risk` per 10-point margin above the win-rate bar, capped at
-  5x) rather than a running additive R-ladder — see `risk_multiplier()`.
-- `state_size` (`len(FEATURES)`, 78 = 17 indicators × 4 analyzed timeframes + 10 1m
-  level features) must match whatever a saved checkpoint was trained with, same caveat
-  as `bot.py`'s own — a feature-set change needs a fresh `train_bot()` run before
-  `test_bot()` can load the new checkpoint, and makes any accumulated
-  `.gbdt_winrate.pkl` samples stale.
+- `bot_v2.py` originally had an LSTM-PPO agent deciding whether to take each strategy's
+  signal, a GBDT win-rate filter gating trades on a predicted win rate, and a risk
+  multiplier scaling position size off that prediction (the "add 1R per +10% predicted
+  win rate" spec). All of that has since been removed by request, down to purely
+  rule-based technical logic — none of the indicators, entry gates, or per-strategy RR
+  described above changed as a result, only the "should we take this signal, and how
+  big" layer that used to sit on top of them.
 - `test_bot()` requires the `MetaTrader5` package and a running MT5 terminal
   (Windows-only); `train_bot()` and the indicator pipeline have no such dependency and
   run anywhere.

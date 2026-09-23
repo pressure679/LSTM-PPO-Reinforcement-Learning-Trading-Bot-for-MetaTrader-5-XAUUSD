@@ -1,6 +1,6 @@
 """
-bot_v2.py -- LSTM-PPO XAUUSD trading bot: three entry strategies sharing
-one agent, one GBDT win-rate filter, one 1m execution loop.
+bot_v2.py -- algorithmic XAUUSD trading bot: three purely rule-based
+entry strategies, one 1m execution loop, no learned model of any kind.
 
 A second, independent strategy set alongside bot.py's ICT/SMC bot, built
 the same way bot.py itself is: it *executes* bar-by-bar on 1-minute
@@ -14,8 +14,10 @@ on the 1m data itself (prefixed 1m_). This is exactly bot.py's own
 multi-timeframe merge (see its add_indicators()), just run across five
 timeframes instead of two, and with a much smaller indicator stack per
 timeframe. On any bar, at most one of the three strategies below can
-produce a candidate trade -- see _select_candidate() for the priority
-order used when more than one would fire at once.
+produce a signal -- see _select_candidate() for the priority order used
+when more than one would fire at once. Whatever it picks is taken
+directly, with no learned model deciding whether to -- the whole bot is
+deterministic technical rules end to end.
 
 STRATEGY 1 -- stoch/%R zone-breakout (see _add_base_indicators(),
 _signal_columns()), 1:4 RR (50-pip SL / 200-pip TP = TP_PIPS):
@@ -32,7 +34,7 @@ _signal_columns()), 1:4 RR (50-pip SL / 200-pip TP = TP_PIPS):
   consecutive bars *of that timeframe*, that run's high/low forms a
   "zone" -- a breakout above the zone high (confirmed by %K crossing
   back above %K-smooth) is bullish; a breakdown below the zone low (%K
-  crossing back below %K-smooth) is bearish. A candidate fires whenever
+  crossing back below %K-smooth) is bearish. A signal fires whenever
   ANY of the 4 timeframes signals a breakout with that timeframe's own
   ADX clearing ADX_MIN. Direction filter: only becomes a trade if the
   1h and/or 4h HalfTrend agrees (--htf-mode "any"/"both"). This is one
@@ -48,7 +50,7 @@ _add_m1_levels(), _level_signal_columns()), sharing a 1:2 RR (the same
 HalfTrend:
 
   2. PDH/PDL + Asia high/low break, retest and reversal (poi_reversal,
-     see _poi_candidate()): a candidate fires in whichever direction
+     see _poi_candidate()): a signal fires in whichever direction
      the 1m HalfTrend currently points, on any bar where price is
      within POI_REACH_PIPS (30) of the previous day's high, the
      previous day's low, the current Asia session's high, or its low
@@ -66,7 +68,7 @@ HalfTrend:
      PDH breakout and a PDH reversal can each fire once the same day,
      but a second PDH breakout that day can't, regardless of outcome.
 
-  3. OB mitigation (ob_mitigation): a candidate fires when the 1m
+  3. OB mitigation (ob_mitigation): a signal fires when the 1m
      HalfTrend *flips* direction (not just agrees) on a bar that's
      also mitigating -- within the same POI_REACH_PIPS reach, via
      OBMitigation(), ported from bot.py's own BullishOB/BearishOB/
@@ -75,53 +77,17 @@ HalfTrend:
      bearish/supply OB mitigated with HalfTrend flipping down is a
      reversal short.
 
-Across all three strategies, the LSTM-PPO agent decides whether to
-actually take whichever candidate wins (or hold) -- the deterministic
-technical stack always picks direction (and which strategy, and that
-strategy's TP), the agent only decides timing. Actions are 0=buy,
-1=sell, 2=hold (BUY/SELL/HOLD below), per spec.
-
-GBDT (XGBoost) win-rate filter -- GBDTWinRateFilter, one shared filter
-(one instance, one feature vector covering every strategy's signals)
-across all three strategies -- has to predict a win rate clearing a
-min-winrate bar before a buy/sell from any strategy is allowed
-through. Each strategy has its own bar:
-  - STOCH_MIN_WINRATE_DEFAULT (35.0%): breakeven (1/(1+rr)) * 1.1 for
-    the stoch breakout's 1:4 RR, floored at 35% since its raw
-    breakeven*1.1 (22%) doesn't clear it (MIN_WINRATE_MULTIPLIER /
-    MIN_WINRATE_FLOOR).
-  - OB_MIN_WINRATE_DEFAULT (36.7%): the same formula for the level
-    strategies' 1:2 RR, whose breakeven*1.1 clears the floor on its
-    own.
-  - POI_MIN_WINRATE_DEFAULT (45%): poi_reversal's own bar, raised
-    above the formula-derived value by explicit request rather than
-    computed from breakeven.
---min-winrate overrides all three defaults with one flat number
-applied alike, for both --train and --test. The filter only starts
-*gating* trades once 5 simulated training weeks have accumulated
-(WEEKS_BEFORE_FILTER) -- before that it keeps fitting/accumulating
-samples in the background but never blocks a trade, so the first
-weeks of training aren't starved waiting on data
-that doesn't exist yet.
-
-Position risk scales with the filter's confidence: once it's active,
-every full 10 percentage points its predicted win rate clears above the
-minimum bar adds one more unit of the base --risk to the position
-(risk_multiplier() below) -- so a barely-qualifying setup risks the
-plain --risk amount, a strongly-favoured one risks several multiples of
-it (capped at MAX_RISK_MULTIPLIER).
+Position sizing is a flat fraction of account balance (--risk, default
+0.01 = 1%) on every trade -- no confidence-based scaling of any kind,
+since there's no model producing a confidence score to scale by.
 
 Weekly stats (trade count, PnL, R-multiple, win rate, mean win/loss,
-streaks, Z-score, profit factor, recovery factor, Sharpe, Sortino, GBDT
-filter state, and a trades-by-strategy breakdown) print every simulated
-training week, same cadence and metrics as bot.py's own weekly report
-(plus the strategy breakdown, which bot.py's single-strategy report has
-no need for).
-
-Checkpoints and the GBDT filter's sample pickle are saved under a
-directory + tag distinct from bot.py's (SAVE_DIR / model_tag()) so the
-two bots -- different feature sets, different state_size -- never
-collide or load each other's incompatible checkpoints.
+streaks, Z-score, profit factor, recovery factor, Sharpe, Sortino, and
+a trades-by-strategy breakdown) print every simulated week during
+--train, same cadence and metrics as bot.py's own weekly report (plus
+the strategy breakdown, which bot.py's single-strategy report has no
+need for) -- there's no training happening, "week" here is purely the
+backtest's own reporting cadence (see TRADING_WEEK_BARS).
 
 Usage mirrors bot.py:
     python bot_v2.py --train
@@ -132,25 +98,16 @@ Usage mirrors bot.py:
 import pandas as pd
 import numpy as np
 import os
-import pickle
-import math
 import time
 import argparse
 import multiprocessing
 from io import StringIO
-from collections import deque
 from datetime import datetime, timedelta
 
-from xgboost import XGBClassifier
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Categorical
-
 # MetaTrader5 only ships Windows wheels and needs a running terminal --
-# imported lazily/defensively so training and indicator work stay usable
-# on any platform; test_bot() fails loudly (not at import time) if it's
-# missing.
+# imported lazily/defensively so the indicator pipeline and --train
+# backtest stay usable on any platform; test_bot() fails loudly (not at
+# import time) if it's missing.
 try:
     import MetaTrader5 as mt5
 except Exception:
@@ -166,7 +123,6 @@ BUY, SELL, HOLD = 0, 1, 2
 # ==========================================================================
 # STRATEGY CONSTANTS
 # ==========================================================================
-SEQ_LEN = 15                    # LSTM lookback window, in 1m bars -- matches bot.py's own SEQ_LEN
 SL_PIPS = 50.0                  # fixed stop-loss
 RR_RATIO = 4.0                  # 1:4 risk:reward
 TP_PIPS = SL_PIPS * RR_RATIO    # 200-pip target
@@ -178,11 +134,7 @@ ZONE_BARS = 5                   # consecutive OB/OS bars (of whichever tf) requi
 STOCH_OS, STOCH_OB = 20, 80     # %K oversold / overbought thresholds
 WR_OS, WR_OB = -80, -20         # Williams %R oversold / overbought thresholds
 
-WEEKS_BEFORE_FILTER = 5         # GBDT win-rate filter starts gating after this many training weeks
 TRADING_WEEK_BARS = 1440 * 5    # 1m bars in a 5-day trading week -- same definition as bot.py's save_count
-
-RISK_STEP = 0.10                # +10 predicted-win-rate points
-MAX_RISK_MULTIPLIER = 5.0       # cap on how many multiples of --risk one trade can size to
 
 # --- PDH/PDL + Asia high/low reversal strategy, and OB-mitigation
 # strategy -- see _add_m1_levels()/_level_signal_columns() below. Both
@@ -194,41 +146,7 @@ POI_REACH_PIPS = 30             # "within 30 pips of poi" -- shared by both leve
 OB_MULTIPLIER = 1.5             # bot.py's BullishOB/BearishOB impulse-candle size multiplier
 OB_LOOKBACK = 72                # bot.py's OBMitigation() lookback, in bars
 
-# Default min-winrate bar, per strategy: breakeven (1/(1+rr)) *
-# MIN_WINRATE_MULTIPLIER, floored at MIN_WINRATE_FLOOR so a
-# high-breakeven low-RR strategy (the level strategies' 1:2 breakeven
-# is already 33.3%) is never satisfied by less than the floor, while a
-# low-breakeven high-RR strategy (the 1:4 stoch breakout's is 20%)
-# still has to clear the floor rather than its own thin 22%.
-# --min-winrate overrides all three of these defaults with one flat
-# number applied alike -- see main().
-MIN_WINRATE_MULTIPLIER = 1.1
-MIN_WINRATE_FLOOR = 0.35
-
-
-def _default_min_winrate(rr_ratio):
-    return max((1 / (1 + rr_ratio)) * MIN_WINRATE_MULTIPLIER, MIN_WINRATE_FLOOR)
-
-
-STOCH_MIN_WINRATE_DEFAULT = _default_min_winrate(RR_RATIO)        # max(22.0%, 35%) = 35.0%
-OB_MIN_WINRATE_DEFAULT = _default_min_winrate(LEVEL_RR_RATIO)     # max(36.7%, 35%) = 36.7%
-
-# poi_reversal's own default -- raised above the formula-derived
-# OB_MIN_WINRATE_DEFAULT (both strategies share the same 1:2 RR, so
-# the formula alone gives them the same 36.7% bar) by explicit
-# request, not by the breakeven*1.1/floor formula.
-POI_MIN_WINRATE_DEFAULT = 0.45
-
 MAGIC = 234567                  # MT5 order/position tag for this bot -- distinct from bot.py's 123456
-SAVE_DIR = "LSTM-PPO-saves-stoch-halftrend"  # separate from bot.py's LSTM-PPO-saves, see module docstring
-
-
-def model_tag(symbol):
-    # Namespaces checkpoints/GBDT pickles under this strategy's own tag
-    # so bot.py's loadcheckpoint() (which matches on "symbol in filename")
-    # never picks up one of this bot's incompatible (different
-    # state_size) checkpoints, and vice versa.
-    return f"{symbol}-stoch-halftrend"
 
 
 # ==========================================================================
@@ -636,12 +554,6 @@ M1_LEVEL_FEATURES = [
     "pdh_dist", "pdl_dist", "asia_high_dist", "asia_low_dist",
 ]
 
-FEATURES = [
-    f"{prefix}_{col}"
-    for prefix, _ in ANALYZED_TIMEFRAMES
-    for col in BASE_INDICATOR_FEATURES
-] + [f"1m_{col}" for col in M1_LEVEL_FEATURES]
-
 
 def _add_base_indicators(df):
     """Adds the shared indicator + zone-breakout stack
@@ -780,416 +692,6 @@ def load_last_mb_xauusd(file_path=None, mb=20, delimiter=",", col_names=None):
     print(f"Loaded: {file_path}")
 
     return df.dropna()
-
-
-# ==========================================================================
-# LSTM-PPO AGENT -- identical to bot.py's (state-vector-agnostic, so
-# reused verbatim aside from the BUY/SELL/HOLD relabeling below).
-# ==========================================================================
-
-class PPOLSTMNetwork(nn.Module):
-    def __init__(self, state_size=12, hidden_size=64, action_size=3):
-        super().__init__()
-
-        self.lstm = nn.LSTM(
-            input_size=state_size,
-            hidden_size=hidden_size,
-            batch_first=True,
-            num_layers=2
-        )
-
-        self.policy = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, action_size)
-        )
-
-        self.value = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        h = out[:, -1, :]
-
-        logits = self.policy(h)
-        value = self.value(h).squeeze(-1)
-
-        return logits, value
-
-
-class LSTMPPOAgent:
-    def __init__(
-        self,
-        state_size,
-        hidden_size,
-        action_size,
-        lr=3e-4,
-        gamma=0.95,
-        clip_ratio=0.2,
-        gae_lambda=0.95
-    ):
-        self.state_size = state_size
-        self.hidden_size = hidden_size
-        self.action_size = action_size
-
-        self.gamma = gamma
-        self.clip_ratio = clip_ratio
-        self.gae_lambda = gae_lambda
-
-        self.train_epochs = 10
-        self.batch_size = 64
-        self.entropy_coef = 0.01
-        self.value_coef = 0.5
-
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-
-        self.model = PPOLSTMNetwork(
-            state_size, hidden_size, action_size
-        ).to(self.device)
-
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(), lr=lr
-        )
-
-        self.trajectory = []
-
-    def _state_tensor(self, state_seq):
-        return torch.tensor(
-            state_seq, dtype=torch.float32, device=self.device
-        ).unsqueeze(0)
-
-    def select_action(self, state_seq, in_position=False, training=False):
-
-        state = self._state_tensor(state_seq)
-
-        with torch.no_grad():
-            logits, value = self.model(state)
-
-        logits = logits.squeeze(0)
-
-        # Only HOLD is valid while a position is open -- can't stack a
-        # second trade. (bot.py's equivalent masks to [0]=hold; here
-        # hold is action index 2, per the BUY/SELL/HOLD spec ordering.)
-        valid_actions = [HOLD] if in_position else [BUY, SELL, HOLD]
-
-        masked_logits = logits.clone()
-
-        for i in range(self.action_size):
-            if i not in valid_actions:
-                masked_logits[i] = -1e9
-
-        probs = torch.softmax(masked_logits, dim=-1)
-        dist = Categorical(probs)
-
-        action = dist.sample() if training else torch.argmax(probs)
-
-        logprob = dist.log_prob(action)
-
-        return (
-            int(action.item()),
-            float(logprob.item()),
-            float(value.item())
-        )
-
-    def store_transition(self, state_seq, action, logprob, value, reward, done):
-        self.trajectory.append((
-            np.array(state_seq, dtype=np.float32),
-            action, logprob, value, reward, done
-        ))
-
-    def compute_gae(self, rewards, values, dones):
-        advantages = []
-        gae = 0
-
-        values = np.append(values, 0.0)
-
-        for t in reversed(range(len(rewards))):
-            delta = (
-                rewards[t]
-                + self.gamma * values[t + 1] * (1 - dones[t])
-                - values[t]
-            )
-            gae = (
-                delta
-                + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
-            )
-            advantages.insert(0, gae)
-
-        return np.array(advantages, dtype=np.float32)
-
-    def train(self):
-
-        if len(self.trajectory) < 32:
-            return
-
-        states, actions, old_logprobs, values, rewards, dones = zip(*self.trajectory)
-
-        states = np.array(states, dtype=np.float32)
-        actions = np.array(actions)
-        old_logprobs = np.array(old_logprobs, dtype=np.float32)
-        values = np.array(values, dtype=np.float32)
-        rewards = np.array(rewards, dtype=np.float32)
-        dones = np.array(dones, dtype=np.float32)
-
-        advantages = self.compute_gae(rewards, values, dones)
-        returns = advantages + values
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        states = torch.tensor(states, dtype=torch.float32, device=self.device)
-        actions = torch.tensor(actions, dtype=torch.long, device=self.device)
-        old_logprobs = torch.tensor(old_logprobs, dtype=torch.float32, device=self.device)
-        returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
-        advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
-
-        n = len(states)
-
-        for _ in range(self.train_epochs):
-            idx = torch.randperm(n, device=self.device)
-
-            for start in range(0, n, self.batch_size):
-                batch_idx = idx[start:start + self.batch_size]
-
-                b_states = states[batch_idx]
-                b_actions = actions[batch_idx]
-                b_old_logprobs = old_logprobs[batch_idx]
-                b_returns = returns[batch_idx]
-                b_advantages = advantages[batch_idx]
-
-                logits, values_pred = self.model(b_states)
-                dist = Categorical(logits=logits)
-
-                new_logprobs = dist.log_prob(b_actions)
-                entropy = dist.entropy().mean()
-
-                ratio = torch.exp(new_logprobs - b_old_logprobs)
-
-                surr1 = ratio * b_advantages
-                surr2 = torch.clamp(
-                    ratio, 1 - self.clip_ratio, 1 + self.clip_ratio
-                ) * b_advantages
-
-                policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = F.mse_loss(values_pred, b_returns)
-
-                loss = (
-                    policy_loss
-                    + self.value_coef * value_loss
-                    - self.entropy_coef * entropy
-                )
-
-                self.optimizer.zero_grad()
-                loss.backward()
-
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-
-                self.optimizer.step()
-
-        self.trajectory.clear()
-
-    def savecheckpoint(self, tag):
-        os.makedirs(SAVE_DIR, exist_ok=True)
-
-        filename = (
-            f"{SAVE_DIR}/"
-            f"{datetime.now().strftime('%Y-%m-%d')}-"
-            f"{tag}.checkpoint.pt"
-        )
-
-        torch.save(
-            {"model": self.model.state_dict(), "optimizer": self.optimizer.state_dict()},
-            filename
-        )
-
-    def loadcheckpoint(self, tag):
-        if not os.path.exists(SAVE_DIR):
-            return
-
-        files = [
-            os.path.join(SAVE_DIR, f)
-            for f in os.listdir(SAVE_DIR)
-            if f.endswith(".checkpoint.pt") and tag in f
-        ]
-
-        if not files:
-            return
-
-        latest = max(files, key=os.path.getmtime)
-
-        checkpoint = torch.load(latest, map_location=self.device)
-
-        self.model.load_state_dict(checkpoint["model"])
-
-        if "optimizer" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
-
-        print(f"Loaded checkpoint: {latest}")
-
-
-# ==========================================================================
-# GBDT WIN-RATE FILTER
-# ==========================================================================
-
-class GBDTWinRateFilter:
-    """XGBoost (GBDT) win-rate filter -- every closed trade's entry-time
-    feature vector + win/loss outcome is accumulated, and periodically
-    refit. predict_win_rate() estimates a new setup's win probability;
-    a trade only clears the gate once that estimate is at least the
-    caller's min-winrate bar. One filter instance shared across all
-    three entry strategies, but called with a different bar per
-    strategy -- STOCH_MIN_WINRATE_DEFAULT/POI_MIN_WINRATE_DEFAULT/
-    OB_MIN_WINRATE_DEFAULT (or one flat --min-winrate override for all
-    three) -- see train_bot()/test_bot().
-
-    Two differences from a plain always-on filter, per spec:
-      - ready()/allows() don't gate anything until `weeks_trained`
-        (bumped once per simulated training week in train_bot) reaches
-        WEEKS_BEFORE_FILTER -- fitting/accumulating still happens the
-        whole time, it just isn't *applied* until then.
-      - min_winrate()'s base bar is a plain number, computed by the
-        caller and passed in, not hardcoded here -- see
-        _default_min_winrate() and the --min-winrate CLI flag.
-
-    Persisted as raw (X, y) samples (plus weeks_trained), not the fitted
-    model itself, so the sample set survives an algorithm change and
-    keeps accumulating across runs -- same design as bot.py's
-    WinRateModel, capped at max_mb by trimming to the most recent
-    samples once the pickled size exceeds it.
-    """
-
-    def __init__(self, symbol, min_samples=30, max_mb=20):
-        self.symbol = symbol
-        self.min_samples = min_samples
-        self.max_mb = max_mb
-        self.model = None
-        self.X = []
-        self.y = []
-        self.weeks_trained = 0
-        self.trimmed_last_save = False
-
-    def add_sample(self, state, won):
-        self.X.append(np.asarray(state, dtype=np.float32))
-        self.y.append(1 if won else 0)
-
-    def fit(self):
-        if len(self.X) < self.min_samples or len(set(self.y)) < 2:
-            return False
-
-        self.model = XGBClassifier(
-            n_estimators=200,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=1.0,
-            eval_metric="logloss",
-            n_jobs=-1,
-            random_state=42
-        )
-        self.model.fit(np.array(self.X), np.array(self.y))
-        return True
-
-    def predict_win_rate(self, state):
-        if self.model is None:
-            return None
-
-        proba = self.model.predict_proba(
-            np.asarray(state, dtype=np.float32).reshape(1, -1)
-        )[0]
-
-        classes = list(self.model.classes_)
-        return proba[classes.index(1)] if 1 in classes else 0.0
-
-    def ready(self, min_weeks=WEEKS_BEFORE_FILTER):
-        # The filter only "starts" once 5 simulated training weeks have
-        # completed -- see train_bot(). Before that it's a no-op even
-        # if a model already happens to be fit.
-        return self.model is not None and self.weeks_trained >= min_weeks
-
-    def allows(self, state, min_winrate, min_weeks=WEEKS_BEFORE_FILTER):
-        if not self.ready(min_weeks):
-            return True
-        return self.predict_win_rate(state) >= min_winrate
-
-    def _path(self):
-        return os.path.join(SAVE_DIR, f"{self.symbol}.gbdt_winrate.pkl")
-
-    def _trim_to_max_size(self):
-        if len(self.X) < 2:
-            self.trimmed_last_save = False
-            return
-
-        max_bytes = self.max_mb * 1024 * 1024
-        current_bytes = len(pickle.dumps({"X": self.X, "y": self.y}))
-
-        if current_bytes <= max_bytes:
-            self.trimmed_last_save = False
-            return
-
-        bytes_per_sample = current_bytes / len(self.X)
-        keep = max(int(max_bytes / bytes_per_sample), self.min_samples)
-
-        self.X = self.X[-keep:]
-        self.y = self.y[-keep:]
-        self.trimmed_last_save = True
-
-    def file_size_mb(self):
-        path = self._path()
-        if not os.path.exists(path):
-            return 0.0
-        return os.path.getsize(path) / (1024 * 1024)
-
-    def min_winrate(self, base_min_winrate, elevated_min_winrate=0.9, size_threshold_mb=5):
-        if self.trimmed_last_save or self.file_size_mb() > size_threshold_mb:
-            return elevated_min_winrate
-        return base_min_winrate
-
-    def save(self):
-        os.makedirs(SAVE_DIR, exist_ok=True)
-        self._trim_to_max_size()
-
-        with open(self._path(), "wb") as f:
-            pickle.dump(
-                {"X": self.X, "y": self.y, "weeks_trained": self.weeks_trained}, f
-            )
-
-    def load(self):
-        path = self._path()
-        if not os.path.exists(path):
-            return False
-
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-
-        self.X = data["X"]
-        self.y = data["y"]
-        self.weeks_trained = data.get("weeks_trained", 0)
-
-        self.fit()
-        return True
-
-
-def risk_multiplier(predicted_win_rate, min_winrate, step=RISK_STEP, max_multiplier=MAX_RISK_MULTIPLIER):
-    """"Add 1R to risk per +10% predicted win rate": every full `step`
-    (default 10 points) the filter's predicted win rate clears above
-    the min-winrate bar adds one more unit of the base --risk to the
-    position -- e.g. a setup predicted at 65% against a 35% bar (a
-    30-point margin) risks 1 + 3 = 4x base risk. Returns 1.0 (base risk,
-    no bonus) whenever the filter isn't active yet (predicted_win_rate
-    is None) or the setup only just clears the bar."""
-    if predicted_win_rate is None:
-        return 1.0
-
-    margin = predicted_win_rate - min_winrate
-    if margin <= 0:
-        return 1.0
-
-    bonus_r = math.floor(margin / step)
-    return min(1.0 + bonus_r, max_multiplier)
 
 
 # ==========================================================================
@@ -1391,7 +893,7 @@ def close_trades(magic=MAGIC):
 
 
 # ==========================================================================
-# TRAINING
+# CANDIDATE SELECTION + BACKTEST
 # ==========================================================================
 
 def _htf_ok_columns(df, htf_mode):
@@ -1475,8 +977,8 @@ def _poi_candidate(bull_ht, bear_ht, near_pdh, near_pdl, near_asia_high, near_as
     can only produce a candidate once per day; `used_today` is a set of
     "{level}_{event}" keys already spent today, and it's the caller's
     job to add the key this returns to it once a trade off it actually
-    opens (not just whenever the candidate fires -- a candidate that
-    never gets taken, e.g. rejected by the GBDT filter, doesn't spend
+    opens (not just whenever the candidate fires -- a bar that's
+    already in_position, so nothing gets opened off it, doesn't spend
     the day's slot). Levels are checked in POI_LEVEL_KINDS order;
     ties (more than one level in reach at once) go to the first.
     Returns (action, key) or (HOLD, None)."""
@@ -1525,9 +1027,10 @@ def _select_candidate(
     _poi_candidate()'s once-per-level-per-event-per-day cap), then OB
     mitigation. More than one firing on the same bar (in the same or
     opposite directions) is rare given how differently each triggers,
-    and resolved by this order rather than reconciled -- the agent
-    still decides whether to actually take whatever candidate wins.
-    poi_key is only meaningful when strategy_name == "poi_reversal";
+    and resolved by this order rather than reconciled -- whatever this
+    returns is taken directly (see train_bot()/test_bot()), there's no
+    further "should we take this" decision downstream. poi_key is only
+    meaningful when strategy_name == "poi_reversal";
     the caller adds it to poi_used_today once (and only once) a trade
     off it actually opens. Returns (HOLD, TP_PIPS, None, None) if
     nothing fires."""
@@ -1550,9 +1053,74 @@ def _select_candidate(
     return HOLD, TP_PIPS, None, None
 
 
-def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
+def _print_period_stats(symbol, label, trade_returns, strategy_counts):
+    """Prints one stats block (see train_bot()'s WEEKLY STATS comment
+    for why every value is guarded against an empty trade_returns).
+    Shared by the weekly cadence and the final partial period at the
+    end of the backtest."""
+    wins = [r for r in trade_returns if r > 0]
+    losses = [r for r in trade_returns if r < 0]
 
-    print("Training bot (stoch/%R breakout + PDH/PDL/Asia reversal + OB mitigation)")
+    weekly_pnl = np.sum(trade_returns)
+    winrate = len(wins) / len(trade_returns) if trade_returns else 0.0
+    mean_win = np.mean(wins) if wins else 0.0
+    mean_loss = np.mean(losses) if losses else 0.0
+
+    sharpe = sharpe_ratio(trade_returns) if trade_returns else 0.0
+    sortino = sortino_ratio(trade_returns) if trade_returns else 0.0
+
+    std_ret = np.std(trade_returns) if trade_returns else 0.0
+    zscore = np.mean(trade_returns) / std_ret if std_ret > 0 else 0.0
+
+    avg_win_streak, avg_loss_streak = streak_stats(trade_returns)
+
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+    max_dd = max_drawdown(trade_returns)
+    R_pnl = weekly_pnl / SL_PIPS
+    rf = R_pnl / (max_dd / SL_PIPS) if max_dd > 0 else 0.0
+
+    print()
+    print("================================================")
+    print(f"[{symbol}] {label}")
+    print("================================================")
+    print(f"Trades:          {len(trade_returns)}")
+    print(f"PnL:             {weekly_pnl:.0f} pips")
+    print(f"R PnL:           {R_pnl:.2f}R")
+    print(f"Max DD:          {max_dd/SL_PIPS:.2f}R")
+    print(f"Winrate:         {winrate*100:.2f}%")
+    print(f"Mean Win:        {mean_win:.0f} pips")
+    print(f"Mean Loss:       {mean_loss:.0f} pips")
+    print(f"Avg Win Streak:  {avg_win_streak:.2f}")
+    print(f"Avg Loss Streak: {avg_loss_streak:.2f}")
+    print(f"Z-score:         {zscore:.2f}")
+    print(f"PF:              {profit_factor:.2f}")
+    print(f"RF:              {rf:.2f}")
+    print(f"Sharpe:          {sharpe:.2f}")
+    print(f"Sortino:         {sortino:.2f}")
+    print(
+        f"By strategy:     "
+        f"stoch={strategy_counts['stoch_breakout']} "
+        f"poi={strategy_counts['poi_reversal']} "
+        f"ob={strategy_counts['ob_mitigation']}"
+    )
+    print("================================================")
+    print()
+
+
+def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
+    """Backtests the three strategies bar-by-bar, once, over the
+    historical 1m data -- there's no learned model, so unlike bot.py's
+    train_bot() there's nothing to iterate passes over; a single pass
+    is the whole backtest. Prints the same weekly stats bot.py's own
+    train_bot() does, every TRADING_WEEK_BARS, plus a final block for
+    whatever's left in the last partial week. --train is kept as the
+    flag name (matching bot.py's convention) even though nothing here
+    trains anything."""
+
+    print("Backtesting (stoch/%R breakout + PDH/PDL/Asia reversal + OB mitigation)")
     start = time.perf_counter()
 
     TRAIN_HISTORY_MB = 20
@@ -1579,35 +1147,9 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
     df["near_asia_high"] = df["1m_asia_high_dist"].abs() <= POI_REACH_PIPS
     df["near_asia_low"] = df["1m_asia_low_dist"].abs() <= POI_REACH_PIPS
 
-    tag = model_tag(symbol)
-
-    agent = LSTMPPOAgent(state_size=len(FEATURES), hidden_size=64, action_size=3)
-    gbdt = GBDTWinRateFilter(tag)
-
-    try:
-        agent.loadcheckpoint(tag)
-        gbdt.load()
-        print(f"[{symbol}] Loaded checkpoint")
-    except Exception as e:
-        print(f"[{symbol}] Starting fresh ({e})")
-
-    # Three separate bars -- one per strategy -- unless --min-winrate
-    # passed one flat number for all three. See
-    # STOCH_MIN_WINRATE_DEFAULT/POI_MIN_WINRATE_DEFAULT/
-    # OB_MIN_WINRATE_DEFAULT.
-    stoch_base_min_winrate = min_winrate if min_winrate is not None else STOCH_MIN_WINRATE_DEFAULT
-    poi_base_min_winrate = min_winrate if min_winrate is not None else POI_MIN_WINRATE_DEFAULT
-    ob_base_min_winrate = min_winrate if min_winrate is not None else OB_MIN_WINRATE_DEFAULT
-
-    STOCH_MIN_WINRATE = gbdt.min_winrate(stoch_base_min_winrate)
-    POI_MIN_WINRATE = gbdt.min_winrate(poi_base_min_winrate)
-    OB_MIN_WINRATE = gbdt.min_winrate(ob_base_min_winrate)
-
     # Precompute everything the loop needs as plain arrays once, up
-    # front, same spirit as bot.py's weekly-slice caching but simpler
-    # since the full feature matrix here (1m bars x 78 features) is
-    # small enough to hold in memory for the whole run at once.
-    feature_matrix = df[FEATURES].to_numpy(dtype=np.float32)
+    # front -- much cheaper than repeated .iloc[i] Series construction
+    # over what can be a few hundred thousand 1m bars.
     close_arr = df["Close"].to_numpy()
     high_arr = df["High"].to_numpy()
     low_arr = df["Low"].to_numpy()
@@ -1629,9 +1171,6 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
     in_position = False
     position_type = None
     entry_price = sl_price = tp_price = 0.0
-    entry_state = None
-    entry_strategy = None
-    mult = 1.0
 
     # poi_reversal's once-per-(level, breakout-or-reversal)-per-day cap
     # -- see _poi_candidate(). Reset whenever the calendar date changes.
@@ -1640,280 +1179,130 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
 
     trade_returns = []
     strategy_counts = {"stoch_breakout": 0, "poi_reversal": 0, "ob_mitigation": 0}
-    state_buffer = deque(maxlen=SEQ_LEN)
 
-    loop_count = 0
-    training_start_2 = time.time()
-    training_start_3 = time.time()
+    run_start = time.time()
+    period_start = time.time()
 
-    try:
-        while True:
-            loop_count += 1
-            print(f"[{symbol}] [INFO] Starting pass {loop_count} over dataset")
+    print(f"[{symbol}] [INFO] Backtesting {len(df)} bars...")
 
-            for i in range(SEQ_LEN, len(df)):
+    for i in range(len(df)):
 
-                current_price = close_arr[i]
-                high = high_arr[i]
-                low = low_arr[i]
+        current_price = close_arr[i]
+        high = high_arr[i]
+        low = low_arr[i]
 
-                state = feature_matrix[i]
-                state_buffer.append(state)
+        if date_arr[i] != current_poi_day:
+            current_poi_day = date_arr[i]
+            poi_used_today = set()
 
-                if len(state_buffer) < SEQ_LEN:
-                    continue
+        # Candidate direction (and which of the three strategies it
+        # comes from, and that strategy's own TP) comes entirely from
+        # the deterministic technical stack -- whatever it returns is
+        # taken directly, no learned model in the loop deciding
+        # whether to.
+        action, tp_pips, strategy, poi_key = _select_candidate(
+            bull_signal_arr[i], bear_signal_arr[i],
+            long_htf_ok_arr[i], short_htf_ok_arr[i],
+            bull_ht_arr[i], bear_ht_arr[i],
+            near_pdh_arr[i], near_pdl_arr[i], near_asia_high_arr[i], near_asia_low_arr[i],
+            poi_used_today,
+            ob_bull_arr[i], ob_bear_arr[i],
+        )
 
-                state_seq = np.array(state_buffer)
+        pnl = 0.0
 
-                result = agent.select_action(state_seq, in_position, training=True)
-                if result is None:
-                    continue
+        if action == BUY and not in_position:
+            in_position = True
+            position_type = "long"
+            entry_price = current_price
 
-                action, logprob, value = result
+            sl_price = entry_price - SL_PIPS * PIP_VALUE
+            tp_price = entry_price + tp_pips * PIP_VALUE
 
-                if date_arr[i] != current_poi_day:
-                    current_poi_day = date_arr[i]
-                    poi_used_today = set()
+            strategy_counts[strategy] += 1
+            if strategy == "poi_reversal":
+                poi_used_today.add(poi_key)
 
-                # Candidate direction (and which of the three
-                # strategies it comes from, and that strategy's own
-                # TP) comes from the deterministic technical stack, not
-                # the agent's own guess -- the agent's job is only
-                # deciding whether to *take* a signal that already
-                # exists (mirrors bot.py's HalfTrend-redirect:
-                # technicals pick direction, the agent times entries).
-                candidate, candidate_tp_pips, candidate_strategy, candidate_poi_key = _select_candidate(
-                    bull_signal_arr[i], bear_signal_arr[i],
-                    long_htf_ok_arr[i], short_htf_ok_arr[i],
-                    bull_ht_arr[i], bear_ht_arr[i],
-                    near_pdh_arr[i], near_pdl_arr[i], near_asia_high_arr[i], near_asia_low_arr[i],
-                    poi_used_today,
-                    ob_bull_arr[i], ob_bear_arr[i],
-                )
+        elif action == SELL and not in_position:
+            in_position = True
+            position_type = "short"
+            entry_price = current_price
 
-                # Which of the three bars applies depends on which
-                # strategy the candidate came from. Only meaningful
-                # once candidate != HOLD, i.e. candidate_strategy is
-                # set.
-                active_min_winrate = {
-                    "stoch_breakout": STOCH_MIN_WINRATE,
-                    "poi_reversal": POI_MIN_WINRATE,
-                    "ob_mitigation": OB_MIN_WINRATE,
-                }.get(candidate_strategy)
+            sl_price = entry_price + SL_PIPS * PIP_VALUE
+            tp_price = entry_price - tp_pips * PIP_VALUE
 
-                if action in (BUY, SELL):
-                    action = candidate if candidate != HOLD else HOLD
+            strategy_counts[strategy] += 1
+            if strategy == "poi_reversal":
+                poi_used_today.add(poi_key)
 
-                # GBDT win-rate filter -- only gates once
-                # WEEKS_BEFORE_FILTER simulated weeks have completed
-                # (gbdt.ready()); before that it's a no-op so early
-                # training isn't blocked waiting on data that doesn't
-                # exist yet, but it keeps fitting/accumulating the
-                # whole time.
-                predicted_wr = None
-                if action in (BUY, SELL) and gbdt.ready():
-                    predicted_wr = gbdt.predict_win_rate(state)
-                    if predicted_wr < active_min_winrate:
-                        action = HOLD
+        if in_position:
+            trade_closed = False
 
-                pnl = 0.0
-                done = False
+            if position_type == "long":
+                if high >= tp_price:
+                    pnl = (tp_price - entry_price) / PIP_VALUE - COMMISSION
+                    trade_closed = True
+                if low <= sl_price:
+                    pnl = (sl_price - entry_price) / PIP_VALUE - COMMISSION
+                    trade_closed = True
 
-                if action == BUY and not in_position:
-                    in_position = True
-                    position_type = "long"
-                    entry_price = current_price
-                    entry_state = state.copy()
-                    entry_strategy = candidate_strategy
-                    mult = risk_multiplier(predicted_wr, active_min_winrate)
+            elif position_type == "short":
+                if low <= tp_price:
+                    pnl = (entry_price - tp_price) / PIP_VALUE - COMMISSION
+                    trade_closed = True
+                if high >= sl_price:
+                    pnl = (entry_price - sl_price) / PIP_VALUE - COMMISSION
+                    trade_closed = True
 
-                    sl_price = entry_price - SL_PIPS * PIP_VALUE
-                    tp_price = entry_price + candidate_tp_pips * PIP_VALUE
+            if trade_closed:
+                in_position = False
+                trade_returns.append(pnl)
 
-                    strategy_counts[entry_strategy] += 1
-                    if entry_strategy == "poi_reversal":
-                        poi_used_today.add(candidate_poi_key)
+        save_counter += 1
 
-                    agent.store_transition(state_seq, action, logprob, value, pnl, done)
+        # ==================================================================
+        # WEEKLY STATS
+        # ==================================================================
+        # Printed every TRADING_WEEK_BARS regardless of how many trades
+        # that stretch had -- including zero -- so a quiet week is
+        # still visible rather than silently skipped. Every stat in
+        # _print_period_stats() is guarded against an empty
+        # trade_returns (np.mean/np.std/winrate would otherwise divide
+        # by zero or warn); streak_stats() and max_drawdown() already
+        # handle empty input on their own.
+        if save_counter % TRADING_WEEK_BARS == 0:
 
-                elif action == SELL and not in_position:
-                    in_position = True
-                    position_type = "short"
-                    entry_price = current_price
-                    entry_state = state.copy()
-                    entry_strategy = candidate_strategy
-                    mult = risk_multiplier(predicted_wr, active_min_winrate)
+            _print_period_stats(symbol, "WEEKLY STATS", trade_returns, strategy_counts)
 
-                    sl_price = entry_price + SL_PIPS * PIP_VALUE
-                    tp_price = entry_price - candidate_tp_pips * PIP_VALUE
+            trade_returns = []
+            strategy_counts = {"stoch_breakout": 0, "poi_reversal": 0, "ob_mitigation": 0}
 
-                    strategy_counts[entry_strategy] += 1
-                    if entry_strategy == "poi_reversal":
-                        poi_used_today.add(candidate_poi_key)
+            completed = int(save_counter / TRADING_WEEK_BARS)
+            total = max(int(round(len(df) / TRADING_WEEK_BARS, 0)), 1)
 
-                    agent.store_transition(state_seq, action, logprob, value, pnl, done)
+            elapsed_run = time.time() - run_start
+            avg_time = elapsed_run / max(completed, 1)
+            remaining = max(total - completed, 0)
+            eta = remaining * avg_time
 
-                if in_position:
-                    trade_closed = False
+            print(
+                f"[{symbol}] [INFO] "
+                f"{completed}/{total} ({completed/total*100:.1f}%) | "
+                f"Elapsed: {timedelta(seconds=int(elapsed_run))} | "
+                f"ETA: {timedelta(seconds=int(eta))} | "
+                f"Period: {timedelta(seconds=int(time.time() - period_start))}"
+            )
 
-                    if position_type == "long":
-                        if high >= tp_price:
-                            pnl = ((tp_price - entry_price) / PIP_VALUE - COMMISSION) * mult
-                            trade_closed = True
-                        if low <= sl_price:
-                            pnl = ((sl_price - entry_price) / PIP_VALUE - COMMISSION) * mult
-                            trade_closed = True
+            period_start = time.time()
 
-                    elif position_type == "short":
-                        if low <= tp_price:
-                            pnl = ((entry_price - tp_price) / PIP_VALUE - COMMISSION) * mult
-                            trade_closed = True
-                        if high >= sl_price:
-                            pnl = ((entry_price - sl_price) / PIP_VALUE - COMMISSION) * mult
-                            trade_closed = True
+    # Whatever's left in the final, partial week.
+    if trade_returns or any(strategy_counts.values()):
+        _print_period_stats(symbol, "FINAL PARTIAL PERIOD", trade_returns, strategy_counts)
 
-                    if trade_closed:
-                        in_position = False
-                        done = True
-                        trade_returns.append(pnl)
-                        gbdt.add_sample(entry_state, pnl > 0)
-
-                        agent.store_transition(state_seq, action, logprob, value, pnl, done)
-
-                save_counter += 1
-
-                # ==========================================================
-                # WEEKLY TRAINING
-                # ==========================================================
-                if save_counter % TRADING_WEEK_BARS == 0:
-
-                    # Printed every week regardless of how many trades
-                    # it had -- including zero -- so a quiet week is
-                    # still visible rather than silently skipped. Every
-                    # stat below is guarded against an empty
-                    # trade_returns (np.mean/np.std/winrate would
-                    # otherwise warn or divide by zero); streak_stats()
-                    # and max_drawdown() already handle empty input on
-                    # their own.
-                    wins = [r for r in trade_returns if r > 0]
-                    losses = [r for r in trade_returns if r < 0]
-
-                    weekly_pnl = np.sum(trade_returns)
-                    winrate = len(wins) / len(trade_returns) if trade_returns else 0.0
-                    mean_win = np.mean(wins) if wins else 0.0
-                    mean_loss = np.mean(losses) if losses else 0.0
-
-                    sharpe = sharpe_ratio(trade_returns) if trade_returns else 0.0
-                    sortino = sortino_ratio(trade_returns) if trade_returns else 0.0
-
-                    std_ret = np.std(trade_returns) if trade_returns else 0.0
-                    zscore = np.mean(trade_returns) / std_ret if std_ret > 0 else 0.0
-
-                    avg_win_streak, avg_loss_streak = streak_stats(trade_returns)
-
-                    gross_profit = sum(wins)
-                    gross_loss = abs(sum(losses))
-                    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
-
-                    max_dd = max_drawdown(trade_returns)
-                    R_pnl = weekly_pnl / SL_PIPS
-                    rf = R_pnl / (max_dd / SL_PIPS) if max_dd > 0 else 0.0
-
-                    print()
-                    print("================================================")
-                    print(f"[{symbol}] WEEKLY PPO TRAINING")
-                    print("================================================")
-                    print(f"Trades:          {len(trade_returns)}")
-                    print(f"Weekly PnL:      {weekly_pnl:.0f} pips")
-                    print(f"Weekly R PnL:    {R_pnl:.2f}R")
-                    print(f"Max DD:          {max_dd/SL_PIPS:.2f}R")
-                    print(f"Winrate:         {winrate*100:.2f}%")
-                    print(f"Mean Win:        {mean_win:.0f} pips")
-                    print(f"Mean Loss:       {mean_loss:.0f} pips")
-                    print(f"Avg Win Streak:  {avg_win_streak:.2f}")
-                    print(f"Avg Loss Streak: {avg_loss_streak:.2f}")
-                    print(f"Z-score:         {zscore:.2f}")
-                    print(f"PF:              {profit_factor:.2f}")
-                    print(f"RF:              {rf:.2f}")
-                    print(f"Sharpe:          {sharpe:.2f}")
-                    print(f"Sortino:         {sortino:.2f}")
-                    print(f"Min WR (stoch):  {STOCH_MIN_WINRATE*100:.1f}%")
-                    print(f"Min WR (poi):    {POI_MIN_WINRATE*100:.1f}%")
-                    print(f"Min WR (ob):     {OB_MIN_WINRATE*100:.1f}%")
-                    filter_state = (
-                        "ACTIVE" if gbdt.ready()
-                        else f"bootstrapping ({gbdt.weeks_trained}/{WEEKS_BEFORE_FILTER} weeks)"
-                    )
-                    print(f"GBDT filter:     {filter_state}")
-                    print(
-                        f"By strategy:     "
-                        f"stoch={strategy_counts['stoch_breakout']} "
-                        f"poi={strategy_counts['poi_reversal']} "
-                        f"ob={strategy_counts['ob_mitigation']}"
-                    )
-                    print("================================================")
-                    print()
-
-                    print(
-                        f"[{symbol}] [INFO] Trained on data "
-                        f"(Elapsed: {timedelta(seconds=int(time.time() - training_start_3))})"
-                    )
-
-                    trade_returns = []
-                    strategy_counts = {"stoch_breakout": 0, "poi_reversal": 0, "ob_mitigation": 0}
-
-                    training_start = time.time()
-                    print(f"[{symbol}] [INFO] Training PPO...")
-                    agent.train()
-                    agent.trajectory.clear()
-
-                    print(
-                        f"[{symbol}] [INFO] Finished training PPO "
-                        f"(Elapsed: {timedelta(seconds=int(time.time() - training_start))})"
-                    )
-
-                    agent.savecheckpoint(tag)
-
-                    gbdt.weeks_trained += 1
-                    if gbdt.fit():
-                        gbdt.save()
-                        STOCH_MIN_WINRATE = gbdt.min_winrate(stoch_base_min_winrate)
-                        POI_MIN_WINRATE = gbdt.min_winrate(poi_base_min_winrate)
-                        OB_MIN_WINRATE = gbdt.min_winrate(ob_base_min_winrate)
-                        print(
-                            f"[{symbol}] [INFO] GBDT filter refit on "
-                            f"{len(gbdt.X)} trades and saved"
-                        )
-
-                    completed = int(save_counter / TRADING_WEEK_BARS)
-                    total = max(int(round(len(df) / TRADING_WEEK_BARS, 0)), 1)
-
-                    elapsed_run = time.time() - training_start_2
-                    avg_time = elapsed_run / max(completed, 1)
-                    remaining = max(total - completed, 0)
-                    eta = remaining * avg_time
-
-                    print(
-                        f"[{symbol}] [INFO] "
-                        f"{completed}/{total} ({completed/total*100:.1f}%) | "
-                        f"Elapsed: {timedelta(seconds=int(elapsed_run))} | "
-                        f"ETA: {timedelta(seconds=int(eta))}"
-                    )
-
-                    training_start_3 = time.time()
-
-    except KeyboardInterrupt:
-        print(f"[{symbol}] [INFO] KeyboardInterrupt received, stopping after {loop_count} pass(es) over the dataset")
-
-    agent.train()
-    agent.savecheckpoint(tag)
-
-    if gbdt.fit():
-        gbdt.save()
-
-    print(f"[{symbol}] [INFO] Finished training")
-
-    return agent
+    print(
+        f"[{symbol}] [INFO] Finished backtest "
+        f"(Elapsed: {timedelta(seconds=int(time.time() - run_start))})"
+    )
 
 
 # ==========================================================================
@@ -1929,7 +1318,7 @@ def _rename_mt5_rates(d):
     return d[["Open", "High", "Low", "Close"]]
 
 
-def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
+def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
 
     if mt5 is None:
         raise RuntimeError(
@@ -1938,26 +1327,6 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
         )
 
     mt5.initialize()
-
-    tag = model_tag(symbol)
-
-    agent = LSTMPPOAgent(state_size=len(FEATURES), hidden_size=64, action_size=3)
-    agent.loadcheckpoint(tag)
-
-    gbdt = GBDTWinRateFilter(tag)
-    gbdt.load()
-
-    # Three separate bars -- one per strategy -- unless --min-winrate
-    # passed one flat number for all three. See
-    # STOCH_MIN_WINRATE_DEFAULT/POI_MIN_WINRATE_DEFAULT/
-    # OB_MIN_WINRATE_DEFAULT.
-    stoch_base_min_winrate = min_winrate if min_winrate is not None else STOCH_MIN_WINRATE_DEFAULT
-    poi_base_min_winrate = min_winrate if min_winrate is not None else POI_MIN_WINRATE_DEFAULT
-    ob_base_min_winrate = min_winrate if min_winrate is not None else OB_MIN_WINRATE_DEFAULT
-
-    STOCH_MIN_WINRATE = gbdt.min_winrate(stoch_base_min_winrate)
-    POI_MIN_WINRATE = gbdt.min_winrate(poi_base_min_winrate)
-    OB_MIN_WINRATE = gbdt.min_winrate(ob_base_min_winrate)
 
     # ==========================================================
     # INITIAL LOAD
@@ -1976,13 +1345,11 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
     df = add_indicators(raw_df.copy())
 
     last_m1_epoch = int(raw_df.index[-1].timestamp())
-    last_trading_date = df.index[-1].date()
-    day_start_balance = mt5.account_info().balance
 
     # poi_reversal's once-per-(level, breakout-or-reversal)-per-day cap
     # -- see _poi_candidate(). Reset whenever the calendar date changes.
     poi_used_today = set()
-    current_poi_day = last_trading_date
+    current_poi_day = df.index[-1].date()
 
     # ==========================================================
     # MAIN LOOP
@@ -2018,21 +1385,10 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
             raw_df = raw_df.tail(LIVE_HISTORY_BARS)
             df = add_indicators(raw_df.copy())
 
-        state_seq = df[FEATURES].tail(SEQ_LEN).to_numpy(dtype=np.float32)
-        if state_seq.shape[0] != SEQ_LEN:
-            print(f"Bad state shape: {state_seq.shape}")
-            continue
-
         # ======================================================
-        # PPO DECISION
+        # DECISION
         # ======================================================
         open_pos = open_positions(symbol)
-
-        result = agent.select_action(state_seq, open_pos > 0, training=False)
-        if result is None:
-            continue
-
-        action, logprob, value = result
 
         current = df.iloc[-1]
         prev = df.iloc[-2]
@@ -2083,35 +1439,17 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
         ob_bull = flip_bull and bool(current["1m_bullish_ob_mitigation"])
         ob_bear = flip_bear and bool(current["1m_bearish_ob_mitigation"])
 
-        candidate, candidate_tp_pips, candidate_strategy, candidate_poi_key = _select_candidate(
+        # Candidate direction (and which of the three strategies it
+        # comes from, and that strategy's own TP) comes entirely from
+        # the deterministic technical stack -- taken directly below,
+        # no learned model deciding whether to.
+        action, candidate_tp_pips, candidate_strategy, candidate_poi_key = _select_candidate(
             bull_signal, bear_signal, long_ok, short_ok,
             bull_ht, bear_ht, near_pdh, near_pdl, near_asia_high, near_asia_low, poi_used_today,
             ob_bull, ob_bear,
         )
 
-        # Which of the three bars applies depends on which strategy the
-        # candidate came from -- see train_bot()'s same logic.
-        active_min_winrate = {
-            "stoch_breakout": STOCH_MIN_WINRATE,
-            "poi_reversal": POI_MIN_WINRATE,
-            "ob_mitigation": OB_MIN_WINRATE,
-        }.get(candidate_strategy)
-
-        if action in (BUY, SELL):
-            action = candidate if candidate != HOLD else HOLD
-
-        state = state_seq[-1]
-        predicted_wr = None
-        if action in (BUY, SELL) and gbdt.ready():
-            predicted_wr = gbdt.predict_win_rate(state)
-            if predicted_wr < active_min_winrate:
-                action = HOLD
-
         current_time = df.index[-1]
-
-        if current_time.date() != last_trading_date:
-            last_trading_date = current_time.date()
-            day_start_balance = mt5.account_info().balance
 
         # Flatten and force HOLD heading into the daily close, same
         # convention as bot.py.
@@ -2128,12 +1466,8 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
             account = mt5.account_info()
             balance = account.balance
 
-            mult = risk_multiplier(predicted_wr, active_min_winrate)
-            effective_risk = risk * mult
-
-            # Lot size: hitting the initial SL costs effective_risk% of
-            # balance.
-            lot = min(max((balance * effective_risk) / (SL_PIPS * 10), 0.01), 100.0)
+            # Lot size: hitting the initial SL costs risk% of balance.
+            lot = min(max((balance * risk) / (SL_PIPS * 10), 0.01), 100.0)
             lot = round(lot, 2)
 
             print(f"[{symbol}] Opening {ACTIONS[action]} via {candidate_strategy} "
@@ -2155,42 +1489,25 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "LSTM-PPO XAUUSD bot: stochastic/%R zone-breakout entries, "
-            "gated by 1h/4h HalfTrend direction and a GBDT win-rate filter."
+            "Algorithmic XAUUSD bot: stochastic/%R zone-breakout, PDH/PDL + "
+            "Asia high/low reversal, and OB-mitigation entries, gated by "
+            "1h/4h and 1m HalfTrend direction -- purely rule-based, no "
+            "learned model."
         )
     )
 
-    parser.add_argument("--train", action="store_true")
-    parser.add_argument("--test", action="store_true")
+    parser.add_argument("--train", action="store_true", help="Backtest against historical data.")
+    parser.add_argument("--test", action="store_true", help="Trade live via MT5.")
     parser.add_argument("--symbol", default="XAUUSD")
     parser.add_argument(
         "--risk", type=float, default=0.01,
-        help=(
-            "Base fraction of account balance risked per trade, before "
-            "the GBDT filter's win-rate risk multiplier is applied "
-            "(default 0.01 = 1%%)."
-        )
+        help="Flat fraction of account balance risked per trade (default 0.01 = 1%%)."
     )
     parser.add_argument(
         "--htf-mode", choices=["any", "both"], default="any",
         help=(
             "'any' (default): a breakout only needs 1h OR 4h HalfTrend "
             "to agree with its direction. 'both': needs both."
-        )
-    )
-    parser.add_argument(
-        "--min-winrate", type=float, default=None, dest="min_winrate",
-        help=(
-            "GBDT win-rate filter threshold, for both --train and --test. "
-            "Default (omit this flag): "
-            f"{STOCH_MIN_WINRATE_DEFAULT*100:.1f}%% for the 1:4 RR stoch/%%R "
-            f"breakout (breakeven*1.1 floored at 35%%), "
-            f"{POI_MIN_WINRATE_DEFAULT*100:.1f}%% for the 1:2 RR PDH/PDL/Asia "
-            f"reversal, {OB_MIN_WINRATE_DEFAULT*100:.1f}%% for the 1:2 RR OB "
-            "mitigation strategy. Pass a value here to use one flat number "
-            "for all three instead. Either way, "
-            "GBDTWinRateFilter.min_winrate() may still raise it further "
-            "once the filter's sample buffer saturates (elevated_min_winrate)."
         )
     )
 
@@ -2204,10 +1521,7 @@ def main():
     if args.train:
         p = multiprocessing.Process(
             target=train_bot,
-            kwargs=dict(
-                symbol=args.symbol, risk=args.risk, htf_mode=args.htf_mode,
-                min_winrate=args.min_winrate,
-            ),
+            kwargs=dict(symbol=args.symbol, risk=args.risk, htf_mode=args.htf_mode),
             daemon=True
         )
         p.start()
@@ -2216,10 +1530,7 @@ def main():
     if args.test:
         p = multiprocessing.Process(
             target=test_bot,
-            kwargs=dict(
-                symbol=args.symbol, risk=args.risk, htf_mode=args.htf_mode,
-                min_winrate=args.min_winrate,
-            ),
+            kwargs=dict(symbol=args.symbol, risk=args.risk, htf_mode=args.htf_mode),
             daemon=True
         )
         p.start()
